@@ -2,19 +2,19 @@
 
 > Actively maintained fork of [atalovesyou/claude-max-api-proxy](https://github.com/atalovesyou/claude-max-api-proxy) with OpenClaw integration, improved streaming, and expanded model support.
 
-**Use your Claude Max subscription ($200/month) with any OpenAI-compatible client — no separate API costs!**
+**Use your existing Claude Code subscription (Pro, Max, or Team) with any OpenAI-compatible client — no separate API costs!**
 
-This proxy wraps the Claude Code CLI as a subprocess and exposes an OpenAI-compatible HTTP API, allowing tools like OpenClaw, Continue.dev, or any OpenAI-compatible client to use your Claude Max subscription instead of paying per-API-call.
+This proxy wraps the Claude Code CLI as a subprocess and exposes an OpenAI-compatible HTTP API, allowing tools like OpenClaw, Continue.dev, or any OpenAI-compatible client to use your Claude subscription instead of paying per-API-call. It works with any subscription tier that Claude Code itself supports — Pro, Max, or Team — not just Max.
 
 ## Why This Exists
 
 | Approach | Cost | Limitation |
 |----------|------|------------|
 | Claude API | ~$15/M input, ~$75/M output tokens | Pay per use |
-| Claude Max | $200/month flat | OAuth blocked for third-party API use |
-| **This Proxy** | $0 extra (uses Max subscription) | Routes through CLI |
+| Claude subscription (Pro/Max/Team) | Flat monthly fee | OAuth blocked for third-party API use |
+| **This Proxy** | $0 extra (uses your existing subscription) | Routes through CLI |
 
-Anthropic blocks OAuth tokens from being used directly with third-party API clients. However, the Claude Code CLI *can* use OAuth tokens. This proxy bridges that gap by wrapping the CLI and exposing a standard API.
+Anthropic blocks OAuth tokens from being used directly with third-party API clients. However, the Claude Code CLI *can* use OAuth tokens from any subscription tier. This proxy bridges that gap by wrapping the CLI and exposing a standard API.
 
 ## How It Works
 
@@ -27,7 +27,7 @@ Your App (OpenClaw, Continue.dev, etc.)
          ↓
    Claude Code CLI (subprocess)
          ↓
-   OAuth Token (from Max subscription)
+   OAuth Token (from your Claude Code subscription)
          ↓
    Anthropic API
          ↓
@@ -56,7 +56,7 @@ Your App (OpenClaw, Continue.dev, etc.)
 
 ## Prerequisites
 
-1. **Claude Max subscription** ($200/month) — [Subscribe here](https://claude.ai)
+1. **A Claude Code subscription** (Pro, Max, or Team) — [Subscribe here](https://claude.ai)
 2. **Claude Code CLI** installed and authenticated:
    ```bash
    npm install -g @anthropic-ai/claude-code
