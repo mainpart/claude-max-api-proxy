@@ -24,3 +24,6 @@ Thumbs.db
 
 # Test coverage
 coverage/
+
+# Local dev convenience scripts
+start-proxy.bat

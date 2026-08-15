@@ -20,6 +20,8 @@ const MODEL_MAP: Record<string, ClaudeModel> = {
   "claude-sonnet-4": "sonnet",
   "claude-sonnet-4-5": "sonnet",
   "claude-sonnet-4-6": "sonnet",
+  "claude-sonnet-5": "sonnet",
+  "claude-opus-5": "opus",
   "claude-haiku-4": "haiku",
   "claude-haiku-4-5": "haiku",
   // Bare aliases
@@ -140,5 +142,28 @@ export function openaiToCli(request: OpenAIChatRequest): CliInput {
     prompt: messagesToPrompt(request.messages),
     model: extractModel(request.model),
     sessionId: request.user, // Use OpenAI's user field for session mapping
+  };
+}
+
+/**
+ * Build CLI input for a request that will --resume an existing Claude CLI
+ * session. Since the CLI already remembers everything up to `sinceIndex`
+ * (it generated the assistant turns itself), we only need to forward the
+ * messages appended since then — not the full history again.
+ */
+export function openaiToCliDelta(
+  request: OpenAIChatRequest,
+  sinceIndex: number
+): CliInput {
+  const newMessages = request.messages
+    .slice(sinceIndex)
+    .filter((m) => m.role !== "assistant");
+
+  return {
+    // Fallback to full history if nothing new was found (shouldn't happen,
+    // but never send an empty prompt to the CLI)
+    prompt: messagesToPrompt(newMessages.length ? newMessages : request.messages),
+    model: extractModel(request.model),
+    sessionId: request.user,
   };
 }

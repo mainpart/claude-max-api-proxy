@@ -5,9 +5,10 @@
  * Uses spawn() instead of exec() to prevent shell injection vulnerabilities.
  */
 
-import { spawn, ChildProcess } from "child_process";
+import { spawn, spawnSync, ChildProcess } from "child_process";
 import { EventEmitter } from "events";
 import fs from "fs/promises";
+import { readFileSync } from "fs";
 import path from "path";
 import type {
   ClaudeCliMessage,
@@ -29,6 +30,8 @@ import type { ClaudeModel } from "../adapter/openai-to-cli.js";
 export interface SubprocessOptions {
   model: ClaudeModel;
   sessionId?: string;
+  /** Resume an existing persisted session (sessionId) instead of creating a new one */
+  resume?: boolean;
   cwd?: string;
   timeout?: number;
 }
@@ -88,6 +91,106 @@ const OPENCLAW_TOOL_MAPPING_PROMPT = [
   "Run `openclaw skills list --eligible --json` to see all available skills.",
 ].join("\n");
 
+/**
+ * Resolve the real Claude CLI binary to spawn.
+ *
+ * On Windows, the global `claude` command is an npm shim (`claude.cmd`) that
+ * just execs a bundled `claude.exe`. Running the shim requires `shell: true`,
+ * which routes our argv through cmd.exe — and cmd.exe treats characters our
+ * appended system prompt legitimately contains (`<`, `>`, `(`, `)`, `&`) as
+ * redirection/grouping/chaining operators, corrupting the argument list that
+ * follows (notably `--session-id`/`--resume`, which silently stop working).
+ * Resolving straight to the `.exe` lets us spawn with `shell: false` and
+ * skip cmd.exe entirely. Falls back to the shim (with shell:true) if the
+ * `.exe` can't be located.
+ */
+let resolvedClaudeBin: { bin: string; shell: boolean } | null = null;
+
+function resolveClaudeBin(): { bin: string; shell: boolean } {
+  if (process.env.CLAUDE_BIN) {
+    // Environment overrides are intentionally not cached. This lets callers
+    // temporarily select a binary without contaminating later resolutions.
+    return { bin: process.env.CLAUDE_BIN, shell: false };
+  }
+
+  if (resolvedClaudeBin) return resolvedClaudeBin;
+
+  if (process.platform === "win32") {
+    try {
+      const where = spawnSync("where.exe", ["claude"], { encoding: "utf8" });
+      const shimPath = (where.stdout || "")
+        .split(/\r?\n/)
+        .map((p) => p.trim())
+        .find((p) => p.toLowerCase().endsWith(".cmd"));
+
+      if (shimPath) {
+        const shimDir = path.dirname(shimPath);
+        const shimContent = readFileSync(shimPath, "utf8");
+        const match = shimContent.match(/"%dp0%\\(.+?\.exe)"/i);
+        if (match) {
+          const exePath = path.join(shimDir, match[1]);
+          resolvedClaudeBin = { bin: exePath, shell: false };
+          return resolvedClaudeBin;
+        }
+      }
+    } catch {
+      // Fall through to shim fallback below
+    }
+
+    resolvedClaudeBin = { bin: "claude", shell: true };
+    return resolvedClaudeBin;
+  }
+
+  resolvedClaudeBin = { bin: "claude", shell: false };
+  return resolvedClaudeBin;
+}
+
+/**
+ * Kill a process and its full descendant tree.
+ *
+ * `ChildProcess.kill()` only signals the direct child. On Windows this is
+ * insufficient because the Claude CLI spawns its own subprocesses (e.g. for
+ * Bash tool calls) that aren't part of a job object — killing just the
+ * parent leaves them running in the background even after a client
+ * disconnect or timeout. `taskkill /T` walks the whole tree instead.
+ */
+function killProcessTree(
+  child: ChildProcess,
+  signal: NodeJS.Signals = "SIGTERM"
+): boolean {
+  const pid = child.pid;
+  if (!pid) return false;
+
+  if (process.platform === "win32") {
+    const taskkill = process.env.SystemRoot
+      ? path.join(process.env.SystemRoot, "System32", "taskkill.exe")
+      : "taskkill.exe";
+    const result = spawnSync(taskkill, ["/PID", String(pid), "/T", "/F"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    if (!result.error && result.status === 0) {
+      return true;
+    }
+
+    // If taskkill could not be started or rejected the request, still make a
+    // best-effort attempt to stop the managed root process. This must not be
+    // reported as a successful tree termination: descendants may still be
+    // running, and callers must remain able to retry.
+    try {
+      child.kill(signal);
+    } catch {}
+    return false;
+  }
+
+  try {
+    return child.kill(signal);
+  } catch {
+    // Process may have already exited
+    return false;
+  }
+}
+
 export class ClaudeSubprocess extends EventEmitter {
   private process: ChildProcess | null = null;
   private buffer: string = "";
@@ -100,26 +203,25 @@ export class ClaudeSubprocess extends EventEmitter {
   async start(prompt: string, options: SubprocessOptions): Promise<void> {
     const args = this.buildArgs(options);
     const timeout = options.timeout || DEFAULT_TIMEOUT;
+    if (process.env.DEBUG_SUBPROCESS) {
+      console.error(`[Subprocess] args: ${JSON.stringify(args)}`);
+      console.error(`[Subprocess] prompt: ${prompt.slice(0, 200)}`);
+    }
 
     return new Promise((resolve, reject) => {
       try {
         // Use spawn() for security - no shell interpretation
-        this.process = spawn(process.env.CLAUDE_BIN || "claude", args, {
+        const { bin, shell } = resolveClaudeBin();
+        this.process = spawn(bin, args, {
           cwd: options.cwd || process.cwd(),
           env: Object.fromEntries(
             Object.entries(process.env).filter(([k]) => k !== "CLAUDECODE")
           ),
           stdio: ["pipe", "pipe", "pipe"],
+          shell,
         });
 
-        // Set timeout
-        this.timeoutId = setTimeout(() => {
-          if (!this.isKilled) {
-            this.isKilled = true;
-            this.process?.kill("SIGTERM");
-            this.emit("error", new Error(`Request timed out after ${timeout}ms`));
-          }
-        }, timeout);
+        this.armTimeout(timeout);
 
         // Handle spawn errors (e.g., claude not found)
         this.process.on("error", (err) => {
@@ -200,14 +302,22 @@ export class ClaudeSubprocess extends EventEmitter {
       "--include-partial-messages", // Enable streaming chunks
       "--model",
       options.model, // Model alias (opus/sonnet/haiku)
-      "--no-session-persistence", // Don't save sessions
       "--append-system-prompt",
       OPENCLAW_TOOL_MAPPING_PROMPT,
       // Prompt is passed via stdin (avoids E2BIG on large inputs)
     ];
 
-    if (options.sessionId) {
+    if (options.sessionId && options.resume) {
+      // Continue a previously persisted session — avoids replaying full history
+      args.push("--resume", options.sessionId);
+    } else if (options.sessionId) {
+      // First turn for this session key — create it under a known ID so we
+      // can --resume it on subsequent turns
       args.push("--session-id", options.sessionId);
+    } else {
+      // No stable session key (e.g. request.user missing) — don't leave
+      // orphaned session files behind
+      args.push("--no-session-persistence");
     }
 
     return args;
@@ -275,10 +385,25 @@ export class ClaudeSubprocess extends EventEmitter {
    */
   kill(signal: NodeJS.Signals = "SIGTERM"): void {
     if (!this.isKilled && this.process) {
-      this.isKilled = true;
       this.clearTimeout();
-      this.process.kill(signal);
+      this.isKilled = killProcessTree(this.process, signal);
     }
+  }
+
+  /**
+   * Arm the request timeout. Kept narrow so tests can deterministically re-arm
+   * the production timeout behavior after their fixture process tree is ready.
+   */
+  private armTimeout(timeout: number): void {
+    this.clearTimeout();
+    this.timeoutId = setTimeout(() => {
+      if (!this.isKilled) {
+        if (this.process) {
+          this.isKilled = killProcessTree(this.process, "SIGTERM");
+        }
+        this.emit("error", new Error(`Request timed out after ${timeout}ms`));
+      }
+    }, timeout);
   }
 
   /**
@@ -294,7 +419,8 @@ export class ClaudeSubprocess extends EventEmitter {
  */
 export async function verifyClaude(): Promise<{ ok: boolean; error?: string; version?: string }> {
   return new Promise((resolve) => {
-    const proc = spawn(process.env.CLAUDE_BIN || "claude", ["--version"], { stdio: "pipe" });
+    const { bin, shell } = resolveClaudeBin();
+    const proc = spawn(bin, ["--version"], { stdio: "pipe", shell });
     let output = "";
 
     proc.stdout?.on("data", (chunk: Buffer) => {
