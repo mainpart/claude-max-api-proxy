@@ -5,7 +5,11 @@
  * against the OpenAI API format. Requires Claude CLI to be installed
  * and authenticated — uses haiku for speed and cost.
  *
- * Run: npm test
+ * These tests spend real subscription tokens, so they are skipped unless
+ * asked for explicitly:
+ *
+ *   npm run test:e2e     # runs this file by name
+ *   RUN_E2E=1 npm test   # runs it alongside the offline suite
  */
 
 import { describe, it, before, after } from "node:test";
@@ -14,10 +18,25 @@ import { startServer, stopServer } from "./server/index.js";
 import type { Server } from "http";
 import type { AddressInfo } from "net";
 
-console.warn("\n" + "=".repeat(70));
-console.warn("  WARNING: THIS TEST USES A REAL CLAUDE CODE CLI INSTANCE");
-console.warn("  IT WILL BURN TOKENS ON YOUR CLAUDE MAX SUBSCRIPTION");
-console.warn("=".repeat(70) + "\n");
+/**
+ * Enabled either by RUN_E2E, or by `npm run test:e2e`. npm exports the name
+ * of the running script in npm_lifecycle_event, which keeps the opt-in
+ * cross-platform — `VAR=1 cmd` in a script is not portable to Windows shells.
+ */
+const E2E_ENABLED =
+  Boolean(process.env.RUN_E2E) ||
+  process.env.npm_lifecycle_event === "test:e2e";
+
+const skip = E2E_ENABLED
+  ? false
+  : "spends real subscription tokens — run `npm run test:e2e` or set RUN_E2E=1";
+
+if (E2E_ENABLED) {
+  console.warn("\n" + "=".repeat(70));
+  console.warn("  WARNING: THIS TEST USES A REAL CLAUDE CODE CLI INSTANCE");
+  console.warn("  IT WILL BURN TOKENS ON YOUR CLAUDE MAX SUBSCRIPTION");
+  console.warn("=".repeat(70) + "\n");
+}
 
 let baseUrl: string;
 let server: Server;
@@ -26,18 +45,20 @@ let server: Server;
 const TEST_TIMEOUT = 120_000;
 
 before(async () => {
+  if (!E2E_ENABLED) return;
   server = await startServer({ port: 0 });
   const addr = server.address() as AddressInfo;
   baseUrl = `http://127.0.0.1:${addr.port}`;
 });
 
 after(async () => {
+  if (!E2E_ENABLED) return;
   await stopServer();
 });
 
 // ─── Health & Models ────────────────────────────────────────────────
 
-describe("health and models", () => {
+describe("health and models", { skip }, () => {
   it("GET /health returns ok", async () => {
     const res = await fetch(`${baseUrl}/health`);
     assert.equal(res.status, 200);
@@ -94,7 +115,7 @@ describe("health and models", () => {
 
 // ─── Non-streaming completion ───────────────────────────────────────
 
-describe("non-streaming completion", { timeout: TEST_TIMEOUT }, () => {
+describe("non-streaming completion", { timeout: TEST_TIMEOUT, skip }, () => {
   it("returns a valid OpenAI response for a simple prompt", async () => {
     const res = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: "POST",
@@ -163,7 +184,7 @@ describe("non-streaming completion", { timeout: TEST_TIMEOUT }, () => {
 
 // ─── Streaming completion ───────────────────────────────────────────
 
-describe("streaming completion", { timeout: TEST_TIMEOUT }, () => {
+describe("streaming completion", { timeout: TEST_TIMEOUT, skip }, () => {
   it("returns valid SSE chunks with usage in final chunk", async () => {
     const res = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: "POST",
