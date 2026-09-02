@@ -11,12 +11,23 @@ import { openaiToCli, openaiToCliDelta } from "../adapter/openai-to-cli.js";
 import {
   cliResultToOpenai,
   createDoneChunk,
+  extractTextContent,
+  finishReasonFromResult,
+  resolveResponseModel,
+  usageFromResult,
 } from "../adapter/cli-to-openai.js";
 import { getSession, setSession, clearSession } from "../subprocess/session-store.js";
-import type { OpenAIChatRequest, OpenAIToolCall } from "../types/openai.js";
+import type { OpenAIChatRequest, OpenAIChatChunk, OpenAIChatChunkDelta } from "../types/openai.js";
+import type {
+  ClaudeCliAssistant,
+  ClaudeCliInit,
+  ClaudeCliRateLimitEvent,
+  ClaudeCliResult,
+  ClaudeCliStreamEvent,
+} from "../types/claude-cli.js";
+import { isRateLimited } from "../types/claude-cli.js";
 import type { ProxyConfig } from "../config.js";
 import { DEFAULTS } from "../config.js";
-import type { ClaudeCliAssistant, ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
 
 interface SessionContext {
   sessionKey: string | undefined;
@@ -87,9 +98,9 @@ export async function handleChatCompletions(
     const sessionCtx: SessionContext = { sessionKey, resume, messageCount: body.messages.length };
 
     if (stream) {
-      await handleStreamingResponse(req, res, subprocess, cliInput, requestId, sessionCtx);
+      await handleStreamingResponse(res, subprocess, cliInput, requestId, sessionCtx, config, body);
     } else {
-      await handleNonStreamingResponse(res, subprocess, cliInput, requestId, sessionCtx);
+      await handleNonStreamingResponse(res, subprocess, cliInput, requestId, sessionCtx, config, body);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
@@ -110,9 +121,126 @@ export async function handleChatCompletions(
 /**
  * Convert Claude tool_use ID to OpenAI-compatible call ID.
  * Claude uses "toolu_abc123", OpenAI uses "call_abc123".
+ *
+ * Unused while the CLI handles its tools internally; kept for the day the
+ * proxy forwards them.
  */
-function toOpenAICallId(claudeId: string): string {
+export function toOpenAICallId(claudeId: string): string {
   return `call_${claudeId.replace("toolu_", "")}`;
+}
+
+/**
+ * An SSE response that flushes its headers late.
+ *
+ * Flushing immediately, as this used to, commits the proxy to a 200 before
+ * the CLI has even started — so a failure to spawn it, or a rejected request,
+ * reached the client as a stream that simply never produced anything. Holding
+ * the headers back until there is something to say keeps an honest HTTP
+ * status available for as long as possible, and the timer makes sure a slow
+ * model still gets its connection established.
+ */
+class SseStream {
+  private flushed = false;
+  private ended = false;
+  private flushTimer: NodeJS.Timeout | null = null;
+
+  constructor(private readonly res: Response, flushDelayMs: number) {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    // nginx buffers proxied responses by default, which turns a token-by-token
+    // stream into one delivery at the end.
+    res.setHeader("X-Accel-Buffering", "no");
+
+    if (flushDelayMs > 0) {
+      this.flushTimer = setTimeout(() => this.flushHeaders(), flushDelayMs);
+      this.flushTimer.unref();
+    }
+  }
+
+  get headersFlushed(): boolean {
+    return this.flushed;
+  }
+
+  flushHeaders(): void {
+    if (this.flushed) return;
+    this.flushed = true;
+    this.clearFlushTimer();
+    if (this.res.writableEnded) return;
+    this.res.flushHeaders();
+    // A comment line confirms to the client that the connection is alive.
+    this.res.write(":ok\n\n");
+  }
+
+  send(chunk: unknown): void {
+    this.flushHeaders();
+    if (this.ended || this.res.writableEnded) return;
+    this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+  }
+
+  /** Terminate the stream. Safe to call more than once. */
+  end(): void {
+    if (this.ended) return;
+    this.ended = true;
+    this.clearFlushTimer();
+    if (this.res.writableEnded) return;
+    this.flushHeaders();
+    this.res.write("data: [DONE]\n\n");
+    this.res.end();
+  }
+
+  /**
+   * Report a failure: an HTTP status while that is still possible, otherwise
+   * an error event followed by a proper end of stream. Either way the client
+   * is left with a finished response rather than a hanging one.
+   */
+  fail(status: number, message: string, headers: Record<string, string> = {}): void {
+    if (!this.flushed) {
+      this.clearFlushTimer();
+      this.ended = true;
+      if (!this.res.writableEnded) {
+        for (const [name, value] of Object.entries(headers)) {
+          this.res.setHeader(name, value);
+        }
+        this.res.status(status).json({
+          error: { message, type: "server_error", code: null },
+        });
+      }
+      return;
+    }
+    this.send({ error: { message, type: "server_error", code: null } });
+    this.end();
+  }
+
+  private clearFlushTimer(): void {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+  }
+}
+
+/** Seconds a client should wait before retrying, from a rate limit notice. */
+function retryAfterSeconds(event: ClaudeCliRateLimitEvent): number {
+  const resetsAt = event.rate_limit_info?.resetsAt;
+  if (typeof resetsAt !== "number") return 60;
+  return Math.max(1, Math.ceil(resetsAt - Date.now() / 1000));
+}
+
+/** Read a string field off a stream delta whose exact shape varies by type. */
+function deltaString(
+  event: ClaudeCliStreamEvent,
+  type: string,
+  field: string
+): string {
+  const delta = event.event.delta as Record<string, unknown> | undefined;
+  if (!delta || delta.type !== type) return "";
+  const value = delta[field];
+  return typeof value === "string" ? value : "";
+}
+
+function statusForError(message: string): number {
+  return /timed out/i.test(message) ? 504 : 500;
 }
 
 /**
@@ -123,33 +251,52 @@ function toOpenAICallId(claudeId: string): string {
  * we use res.on("close") to detect actual client disconnection.
  */
 async function handleStreamingResponse(
-  req: Request,
   res: Response,
   subprocess: ClaudeSubprocess,
   cliInput: ReturnType<typeof openaiToCli>,
   requestId: string,
-  sessionCtx: SessionContext
+  sessionCtx: SessionContext,
+  config: ProxyConfig,
+  body: OpenAIChatRequest
 ): Promise<void> {
-  // Set SSE headers
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Request-Id", requestId);
+  const sse = new SseStream(res, config.streaming.headerFlushMs);
 
-  // CRITICAL: Flush headers immediately to establish SSE connection
-  // Without this, headers are buffered and client times out waiting
-  res.flushHeaders();
-
-  // Send initial comment to confirm connection is alive
-  res.write(":ok\n\n");
-
-  return new Promise<void>((resolve, reject) => {
+  return new Promise<void>((resolve) => {
     let isFirst = true;
-    let lastModel = "claude-sonnet-4";
+    let cliModel: string | undefined;
     let isComplete = false;
     let hasEmittedText = false;
-    let toolCallIndex = 0;
-    let inToolBlock = false;
+    let settled = false;
+
+    const model = () => resolveResponseModel(body.model, cliModel);
+
+    const chunk = (delta: OpenAIChatChunkDelta): OpenAIChatChunk => {
+      const withRole: OpenAIChatChunkDelta = isFirst ? { role: "assistant", ...delta } : delta;
+      isFirst = false;
+      return {
+        id: `chatcmpl-${requestId}`,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model: model(),
+        choices: [{ index: 0, delta: withRole, finish_reason: null }],
+      };
+    };
+
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+
+    /**
+     * Let the CLI write out its session transcript before killing it. The
+     * transcript is what a later --resume reads, so a kill the instant the
+     * result arrives can cost the whole conversation.
+     */
+    const reap = (): void => {
+      const timer = setTimeout(() => subprocess.kill(), config.streaming.resultGraceMs);
+      timer.unref();
+    };
 
     // Handle actual client disconnect (response stream closed)
     res.on("close", () => {
@@ -157,129 +304,53 @@ async function handleStreamingResponse(
         // Client disconnected before response completed - kill subprocess
         subprocess.kill();
       }
-      resolve();
+      finish();
+    });
+
+    // The model identifier is known from the first event of the run. Reading
+    // it from the `assistant` message instead, as this used to, meant every
+    // streamed chunk carried a hardcoded guess, because that message only
+    // arrives after the deltas it is supposed to describe.
+    subprocess.on("init", (msg: ClaudeCliInit) => {
+      cliModel = msg.model ?? cliModel;
+    });
+
+    subprocess.on("message_start", (event: ClaudeCliStreamEvent) => {
+      cliModel = event.event.message?.model ?? cliModel;
+    });
+
+    subprocess.on("assistant", (message: ClaudeCliAssistant) => {
+      cliModel = message.message.model ?? cliModel;
+    });
+
+    subprocess.on("rate_limit", (event: ClaudeCliRateLimitEvent) => {
+      if (!isRateLimited(event)) return;
+      subprocess.kill();
+      isComplete = true;
+      sse.fail(429, `Claude subscription rate limit reached (${event.rate_limit_info.status})`, {
+        "Retry-After": String(retryAfterSeconds(event)),
+      });
+      finish();
+    });
+
+    subprocess.on("thinking_delta", (event: ClaudeCliStreamEvent) => {
+      if (config.streaming.thinking !== "reasoning_content") return;
+      const text = deltaString(event, "thinking_delta", "thinking");
+      if (text) sse.send(chunk({ reasoning_content: text }));
     });
 
     // When a new text content block starts after we've already emitted text,
     // insert a separator so text from different blocks doesn't run together
     subprocess.on("text_block_start", () => {
-      if (hasEmittedText && !res.writableEnded) {
-        const sepChunk = {
-          id: `chatcmpl-${requestId}`,
-          object: "chat.completion.chunk",
-          created: Math.floor(Date.now() / 1000),
-          model: lastModel,
-          choices: [{
-            index: 0,
-            delta: {
-              content: "\n\n",
-            },
-            finish_reason: null,
-          }],
-        };
-        res.write(`data: ${JSON.stringify(sepChunk)}\n\n`);
-      }
+      if (hasEmittedText) sse.send(chunk({ content: "\n\n" }));
     });
 
     // Handle streaming content deltas
     subprocess.on("content_delta", (event: ClaudeCliStreamEvent) => {
-      const delta = event.event.delta;
-      const text = (delta?.type === "text_delta" && delta.text) || "";
-      if (text && !res.writableEnded) {
-        const chunk = {
-          id: `chatcmpl-${requestId}`,
-          object: "chat.completion.chunk",
-          created: Math.floor(Date.now() / 1000),
-          model: lastModel,
-          choices: [{
-            index: 0,
-            delta: {
-              role: isFirst ? "assistant" : undefined,
-              content: text,
-            },
-            finish_reason: null,
-          }],
-        };
-        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-        isFirst = false;
-        hasEmittedText = true;
-      }
-    });
-
-    // DISABLED: Tool call forwarding causes an agentic loop — OpenClaw interprets
-    // Claude Code's internal tool_use (Read, Bash, etc.) as calls it needs to
-    // handle, triggering repeated requests. Claude Code handles tools internally
-    // via --print mode; only the final text result should be forwarded.
-    // TODO: Re-enable with a non-tool_calls display mechanism (e.g. inline text).
-    //
-    // subprocess.on("tool_use_start", (event: ClaudeCliStreamEvent) => {
-    //   if (res.writableEnded) return;
-    //   const block = event.event.content_block;
-    //   if (block?.type !== "tool_use") return;
-    //
-    //   inToolBlock = true;
-    //   const chunk = {
-    //     id: `chatcmpl-${requestId}`,
-    //     object: "chat.completion.chunk",
-    //     created: Math.floor(Date.now() / 1000),
-    //     model: lastModel,
-    //     choices: [{
-    //       index: 0,
-    //       delta: {
-    //         role: isFirst ? "assistant" : undefined,
-    //         tool_calls: [{
-    //           index: toolCallIndex,
-    //           id: toOpenAICallId(block.id),
-    //           type: "function" as const,
-    //           function: {
-    //             name: block.name,
-    //             arguments: "",
-    //           },
-    //         }],
-    //       },
-    //       finish_reason: null,
-    //     }],
-    //   };
-    //   res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-    //   isFirst = false;
-    // });
-    //
-    // subprocess.on("input_json_delta", (event: ClaudeCliStreamEvent) => {
-    //   if (res.writableEnded) return;
-    //   const delta = event.event.delta;
-    //   if (delta?.type !== "input_json_delta") return;
-    //
-    //   const chunk = {
-    //     id: `chatcmpl-${requestId}`,
-    //     object: "chat.completion.chunk",
-    //     created: Math.floor(Date.now() / 1000),
-    //     model: lastModel,
-    //     choices: [{
-    //       index: 0,
-    //       delta: {
-    //         tool_calls: [{
-    //           index: toolCallIndex,
-    //           function: {
-    //             arguments: delta.partial_json,
-    //           },
-    //         }],
-    //       },
-    //       finish_reason: null,
-    //     }],
-    //   };
-    //   res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-    // });
-    //
-    // subprocess.on("content_block_stop", () => {
-    //   if (inToolBlock) {
-    //     toolCallIndex++;
-    //     inToolBlock = false;
-    //   }
-    // });
-
-    // Handle final assistant message (for model name)
-    subprocess.on("assistant", (message: ClaudeCliAssistant) => {
-      lastModel = message.message.model;
+      const text = deltaString(event, "text_delta", "text");
+      if (!text) return;
+      sse.send(chunk({ content: text }));
+      hasEmittedText = true;
     });
 
     subprocess.on("result", (result: ClaudeCliResult) => {
@@ -287,22 +358,21 @@ async function handleStreamingResponse(
       if (sessionCtx.sessionKey && cliInput.sessionId) {
         setSession(sessionCtx.sessionKey, cliInput.sessionId, sessionCtx.messageCount);
       }
-      if (!res.writableEnded) {
-        // Send final done chunk with finish_reason and usage data
-        const doneChunk = createDoneChunk(requestId, lastModel);
-        if (result.usage) {
-          doneChunk.usage = {
-            prompt_tokens: result.usage.input_tokens || 0,
-            completion_tokens: result.usage.output_tokens || 0,
-            total_tokens:
-              (result.usage.input_tokens || 0) + (result.usage.output_tokens || 0),
-          };
-        }
-        res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
-        res.write("data: [DONE]\n\n");
-        res.end();
+
+      // A CLI that produced no partial messages — an older build, or one
+      // whose answer arrived in a single block — would otherwise leave the
+      // client with an empty stream.
+      if (!hasEmittedText && result.result) {
+        sse.send(chunk({ content: result.result }));
+        hasEmittedText = true;
       }
-      resolve();
+
+      const doneChunk = createDoneChunk(requestId, model(), finishReasonFromResult(result));
+      if (result.usage) doneChunk.usage = usageFromResult(result);
+      sse.send(doneChunk);
+      sse.end();
+      reap();
+      finish();
     });
 
     subprocess.on("error", (error: Error) => {
@@ -312,46 +382,39 @@ async function handleStreamingResponse(
       if (sessionCtx.resume && sessionCtx.sessionKey) {
         clearSession(sessionCtx.sessionKey);
       }
-      if (!res.writableEnded) {
-        res.write(
-          `data: ${JSON.stringify({
-            error: { message: error.message, type: "server_error", code: null },
-          })}\n\n`
-        );
-        res.end();
-      }
-      resolve();
+      sse.fail(statusForError(error.message), error.message);
+      finish();
     });
 
     subprocess.on("close", (code: number | null) => {
-      // Subprocess exited - ensure response is closed
-      if (code !== 0 && !isComplete) {
+      if (isComplete) {
+        finish();
+        return;
+      }
+      if (code !== 0) {
         if (sessionCtx.resume && sessionCtx.sessionKey) {
           clearSession(sessionCtx.sessionKey);
         }
-        if (!res.writableEnded) {
-          // Abnormal exit without result - send error
-          res.write(`data: ${JSON.stringify({
-            error: { message: `Process exited with code ${code}`, type: "server_error", code: null },
-          })}\n\n`);
-        }
+        sse.fail(statusForError(""), `Claude CLI exited with code ${code} without a result`);
+      } else {
+        // Clean exit with nothing to say — still terminate the stream.
+        sse.end();
       }
-      if (!res.writableEnded) {
-        res.write("data: [DONE]\n\n");
-        res.end();
-      }
-      resolve();
+      finish();
     });
 
     // Start the subprocess
-    subprocess.start(cliInput.prompt, {
-      model: cliInput.model,
-      sessionId: cliInput.sessionId,
-      resume: sessionCtx.resume,
-    }).catch((err) => {
-      console.error("[Streaming] Subprocess start error:", err);
-      reject(err);
-    });
+    subprocess
+      .start(cliInput.prompt, {
+        model: cliInput.model,
+        sessionId: cliInput.sessionId,
+        resume: sessionCtx.resume,
+      })
+      .catch((err: Error) => {
+        console.error("[Streaming] Subprocess start error:", err.message);
+        sse.fail(statusForError(err.message), err.message);
+        finish();
+      });
   });
 }
 
@@ -363,30 +426,60 @@ async function handleNonStreamingResponse(
   subprocess: ClaudeSubprocess,
   cliInput: ReturnType<typeof openaiToCli>,
   requestId: string,
-  sessionCtx: SessionContext
+  sessionCtx: SessionContext,
+  config: ProxyConfig,
+  body: OpenAIChatRequest
 ): Promise<void> {
   return new Promise((resolve) => {
-    let finalResult: ClaudeCliResult | null = null;
-    // DISABLED: see tool call forwarding comment in handleStreamingResponse
-    // const accumulatedToolCalls: OpenAIToolCall[] = [];
-    //
-    // subprocess.on("assistant", (message: ClaudeCliAssistant) => {
-    //   for (const block of message.message.content) {
-    //     if (block.type === "tool_use") {
-    //       accumulatedToolCalls.push({
-    //         id: toOpenAICallId(block.id),
-    //         type: "function",
-    //         function: {
-    //           name: block.name,
-    //           arguments: JSON.stringify(block.input),
-    //         },
-    //       });
-    //     }
-    //   }
-    // });
+    let responded = false;
+    let lastAssistant: ClaudeCliAssistant | null = null;
 
+    /**
+     * Exactly one response per request. A timeout used to answer 500 and then
+     * the subprocess `close` handler answered a second time, which Express
+     * reports as "Cannot set headers after they are sent".
+     */
+    const respond = (send: () => void): void => {
+      if (responded) return;
+      responded = true;
+      send();
+      resolve();
+    };
+
+    subprocess.on("assistant", (message: ClaudeCliAssistant) => {
+      lastAssistant = message;
+    });
+
+    subprocess.on("rate_limit", (event: ClaudeCliRateLimitEvent) => {
+      if (!isRateLimited(event)) return;
+      subprocess.kill();
+      respond(() => {
+        res
+          .status(429)
+          .set("Retry-After", String(retryAfterSeconds(event)))
+          .json({
+            error: {
+              message: `Claude subscription rate limit reached (${event.rate_limit_info.status})`,
+              type: "server_error",
+              code: "rate_limit_exceeded",
+            },
+          });
+      });
+    });
+
+    // Answer as soon as the CLI reports its result rather than waiting for
+    // the process to exit, which on a wedged subprocess meant holding the
+    // request open until the 15-minute timeout.
     subprocess.on("result", (result: ClaudeCliResult) => {
-      finalResult = result;
+      if (sessionCtx.sessionKey && cliInput.sessionId) {
+        setSession(sessionCtx.sessionKey, cliInput.sessionId, sessionCtx.messageCount);
+      }
+      const content = result.result || (lastAssistant ? extractTextContent(lastAssistant) : "");
+      respond(() => {
+        res.json(cliResultToOpenai(result, requestId, { model: body.model, content }));
+      });
+      const timer = setTimeout(() => subprocess.kill(), config.streaming.resultGraceMs);
+      timer.unref();
     });
 
     subprocess.on("error", (error: Error) => {
@@ -394,37 +487,30 @@ async function handleNonStreamingResponse(
       if (sessionCtx.resume && sessionCtx.sessionKey) {
         clearSession(sessionCtx.sessionKey);
       }
-      res.status(500).json({
-        error: {
-          message: error.message,
-          type: "server_error",
-          code: null,
-        },
+      respond(() => {
+        res.status(statusForError(error.message)).json({
+          error: { message: error.message, type: "server_error", code: null },
+        });
       });
-      resolve();
     });
 
     subprocess.on("close", (code: number | null) => {
-      if (finalResult) {
-        if (sessionCtx.sessionKey && cliInput.sessionId) {
-          setSession(sessionCtx.sessionKey, cliInput.sessionId, sessionCtx.messageCount);
-        }
-        res.json(cliResultToOpenai(finalResult, requestId));
-      } else {
-        if (sessionCtx.resume && sessionCtx.sessionKey) {
-          clearSession(sessionCtx.sessionKey);
-        }
-        if (!res.headersSent) {
-          res.status(500).json({
-            error: {
-              message: `Claude CLI exited with code ${code} without response`,
-              type: "server_error",
-              code: null,
-            },
-          });
-        }
+      if (responded) {
+        resolve();
+        return;
       }
-      resolve();
+      if (sessionCtx.resume && sessionCtx.sessionKey) {
+        clearSession(sessionCtx.sessionKey);
+      }
+      respond(() => {
+        res.status(500).json({
+          error: {
+            message: `Claude CLI exited with code ${code} without response`,
+            type: "server_error",
+            code: null,
+          },
+        });
+      });
     });
 
     // Start the subprocess
@@ -434,15 +520,12 @@ async function handleNonStreamingResponse(
         sessionId: cliInput.sessionId,
         resume: sessionCtx.resume,
       })
-      .catch((error) => {
-        res.status(500).json({
-          error: {
-            message: error.message,
-            type: "server_error",
-            code: null,
-          },
+      .catch((error: Error) => {
+        respond(() => {
+          res.status(statusForError(error.message)).json({
+            error: { message: error.message, type: "server_error", code: null },
+          });
         });
-        resolve();
       });
   });
 }

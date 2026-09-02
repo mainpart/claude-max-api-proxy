@@ -13,6 +13,8 @@ import path from "path";
 import type {
   ClaudeCliMessage,
   ClaudeCliAssistant,
+  ClaudeCliInit,
+  ClaudeCliRateLimitEvent,
   ClaudeCliResult,
   ClaudeCliStreamEvent,
 } from "../types/claude-cli.js";
@@ -24,6 +26,10 @@ import {
   isToolUseBlockStart,
   isInputJsonDelta,
   isContentBlockStop,
+  isMessageStart,
+  isRateLimitEvent,
+  isSystemInit,
+  isThinkingDelta,
 } from "../types/claude-cli.js";
 import type { ClaudeModel } from "../adapter/openai-to-cli.js";
 import type { ProxyConfig } from "../config.js";
@@ -42,6 +48,10 @@ export interface SubprocessOptions {
 
 export interface SubprocessEvents {
   message: (msg: ClaudeCliMessage) => void;
+  init: (msg: ClaudeCliInit) => void;
+  message_start: (event: ClaudeCliStreamEvent) => void;
+  thinking_delta: (event: ClaudeCliStreamEvent) => void;
+  rate_limit: (event: ClaudeCliRateLimitEvent) => void;
   assistant: (msg: ClaudeCliAssistant) => void;
   result: (result: ClaudeCliResult) => void;
   error: (error: Error) => void;
@@ -200,6 +210,7 @@ export class ClaudeSubprocess extends EventEmitter {
   private buffer: string = "";
   private timeoutId: NodeJS.Timeout | null = null;
   private isKilled: boolean = false;
+  private spawnFailed: boolean = false;
   private readonly config: ProxyConfig;
 
   constructor(config: ProxyConfig = DEFAULTS) {
@@ -237,14 +248,24 @@ export class ClaudeSubprocess extends EventEmitter {
         // Handle spawn errors (e.g., claude not found)
         this.process.on("error", (err) => {
           this.clearTimeout();
-          if (err.message.includes("ENOENT")) {
-            reject(
-              new Error(
+          // A process that never started also emits "close", with a synthetic
+          // exit code. Reporting that instead of the spawn failure would tell
+          // the caller "exited with code -2" where the truth is "no binary".
+          this.spawnFailed = true;
+
+          const startError = err.message.includes("ENOENT")
+            ? new Error(
                 "Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code"
               )
-            );
-          } else {
-            reject(err);
+            : err;
+
+          // start() resolves as soon as the process is spawned, because the
+          // caller streams from there on. A spawn failure arrives after that,
+          // when rejecting the promise is already a no-op, so it has to reach
+          // the caller as an event too.
+          reject(startError);
+          if (this.listenerCount("error") > 0) {
+            this.emit("error", startError);
           }
         });
 
@@ -288,6 +309,7 @@ export class ClaudeSubprocess extends EventEmitter {
           if (this.buffer.trim()) {
             this.processBuffer();
           }
+          if (this.spawnFailed) return;
           this.emit("close", code);
         });
 
@@ -370,6 +392,24 @@ export class ClaudeSubprocess extends EventEmitter {
       try {
         const message: ClaudeCliMessage = JSON.parse(trimmed);
         this.emit("message", message);
+
+        // Both carry the model, and both arrive before any text delta —
+        // unlike the `assistant` message, which only lands after them.
+        if (isSystemInit(message)) {
+          this.emit("init", message);
+        }
+
+        if (isMessageStart(message)) {
+          this.emit("message_start", message);
+        }
+
+        if (isRateLimitEvent(message)) {
+          this.emit("rate_limit", message);
+        }
+
+        if (isThinkingDelta(message)) {
+          this.emit("thinking_delta", message as ClaudeCliStreamEvent);
+        }
 
         if (isTextBlockStart(message)) {
           // Emit when a new text content block starts (for inserting separators)

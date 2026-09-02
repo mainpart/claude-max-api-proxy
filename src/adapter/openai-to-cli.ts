@@ -32,6 +32,12 @@ const MODEL_MAP: Record<string, ClaudeModel> = {
   "sonnet-max": "sonnet",
 };
 
+/** Whether the proxy recognises this model identifier. */
+export function isKnownModel(model: string): boolean {
+  if (MODEL_MAP[model]) return true;
+  return Boolean(MODEL_MAP[model.replace(/^(?:claude-code-cli|claude-max)\//, "")]);
+}
+
 /**
  * Extract Claude model alias from request model string
  */

@@ -54,22 +54,36 @@ export interface OpenAIChatResponseChoice {
   finish_reason: "stop" | "length" | "content_filter" | null;
 }
 
+/**
+ * Usage counters. `prompt_tokens` includes cache reads and cache writes:
+ * those are prompt tokens the request actually carried, and reporting only
+ * `input_tokens` understates a cached 20k-token conversation as a couple of
+ * hundred. `prompt_tokens_details.cached_tokens` is how a caller sees from
+ * the HTTP response alone whether prompt caching is working.
+ */
+export interface OpenAIUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  prompt_tokens_details?: {
+    cached_tokens: number;
+  };
+}
+
 export interface OpenAIChatResponse {
   id: string;
   object: "chat.completion";
   created: number;
   model: string;
   choices: OpenAIChatResponseChoice[];
-  usage: {
-    prompt_tokens: number;
-    completion_tokens: number;
-    total_tokens: number;
-  };
+  usage: OpenAIUsage;
 }
 
 export interface OpenAIChatChunkDelta {
   role?: "assistant";
   content?: string;
+  /** Thinking text, for clients that render it. Off by default. */
+  reasoning_content?: string;
   tool_calls?: OpenAIToolCallChunk[];
 }
 
@@ -85,11 +99,7 @@ export interface OpenAIChatChunk {
   created: number;
   model: string;
   choices: OpenAIChatChunkChoice[];
-  usage?: {
-    prompt_tokens: number;
-    completion_tokens: number;
-    total_tokens: number;
-  };
+  usage?: OpenAIUsage;
 }
 
 export interface OpenAIModel {

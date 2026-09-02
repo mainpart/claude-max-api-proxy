@@ -263,6 +263,7 @@ export interface ResultOverrides {
   subtype?: string;
   is_error?: boolean;
   num_turns?: number;
+  stop_reason?: string | null;
   usage?: Record<string, unknown>;
   structured_output?: unknown;
   model?: string;

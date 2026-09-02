@@ -41,6 +41,12 @@ export interface ClaudeCliTextContent {
   text: string;
 }
 
+export interface ClaudeCliThinkingContent {
+  type: "thinking";
+  thinking: string;
+  signature?: string;
+}
+
 export interface ClaudeCliToolUseContent {
   type: "tool_use";
   id: string;
@@ -48,7 +54,28 @@ export interface ClaudeCliToolUseContent {
   input: Record<string, unknown>;
 }
 
-export type ClaudeCliAssistantContent = ClaudeCliTextContent | ClaudeCliToolUseContent;
+export type ClaudeCliAssistantContent =
+  | ClaudeCliTextContent
+  | ClaudeCliThinkingContent
+  | ClaudeCliToolUseContent;
+
+/**
+ * Emitted by the CLI on every request, not only when a limit is hit — an
+ * ordinary successful run carries `status: "allowed"`. Only a status that is
+ * not an "allowed" variant means the request was actually refused.
+ */
+export interface ClaudeCliRateLimitEvent {
+  type: "rate_limit_event";
+  rate_limit_info: {
+    status: string;
+    /** Unix seconds. */
+    resetsAt?: number;
+    rateLimitType?: string;
+    [key: string]: unknown;
+  };
+  session_id?: string;
+  uuid?: string;
+}
 
 export interface ClaudeCliAssistant {
   type: "assistant";
@@ -72,8 +99,13 @@ export interface ClaudeCliAssistant {
 
 export interface ClaudeCliResult {
   type: "result";
-  subtype: "success" | "error";
+  /** "success", "error_max_turns", "error_during_execution", ... */
+  subtype: string;
   is_error: boolean;
+  /** Anthropic stop reason of the final message: end_turn, max_tokens, ... */
+  stop_reason?: string | null;
+  /** Parsed value of the --json-schema response, when one was requested. */
+  structured_output?: unknown;
   duration_ms: number;
   duration_api_ms: number;
   num_turns: number;
@@ -104,21 +136,16 @@ export interface ClaudeCliStreamEvent {
   event: {
     type: "message_start" | "content_block_start" | "content_block_delta" | "content_block_stop" | "message_delta" | "message_stop";
     index?: number;
-    delta?: {
-      type: "text_delta";
-      text: string;
-    } | {
-      type: "input_json_delta";
-      partial_json: string;
-    };
-    content_block?: {
-      type: "text";
-      text: string;
-    } | {
-      type: "tool_use";
-      id: string;
-      name: string;
-    };
+    delta?:
+      | { type: "text_delta"; text: string }
+      | { type: "thinking_delta"; thinking: string }
+      | { type: "signature_delta"; signature: string }
+      | { type: "input_json_delta"; partial_json: string }
+      | { type: string; [key: string]: unknown };
+    content_block?:
+      | { type: "text"; text: string }
+      | { type: "thinking"; thinking: string; signature?: string }
+      | { type: "tool_use"; id: string; name: string };
     message?: {
       model: string;
       id: string;
@@ -137,6 +164,7 @@ export interface ClaudeCliStreamEvent {
 
 export type ClaudeCliMessage =
   | ClaudeCliInit
+  | ClaudeCliRateLimitEvent
   | ClaudeCliHookStarted
   | ClaudeCliHookResponse
   | ClaudeCliAssistant
@@ -194,4 +222,37 @@ export function isTextBlockStart(msg: ClaudeCliMessage): msg is ClaudeCliStreamE
 
 export function isSystemInit(msg: ClaudeCliMessage): msg is ClaudeCliInit {
   return msg.type === "system" && (msg as ClaudeCliSystemMessage).subtype === "init";
+}
+
+export function isMessageStart(msg: ClaudeCliMessage): msg is ClaudeCliStreamEvent {
+  return isStreamEvent(msg) && msg.event.type === "message_start";
+}
+
+export function isThinkingBlockStart(msg: ClaudeCliMessage): msg is ClaudeCliStreamEvent {
+  return (
+    isStreamEvent(msg) &&
+    msg.event.type === "content_block_start" &&
+    msg.event.content_block?.type === "thinking"
+  );
+}
+
+export function isThinkingDelta(msg: ClaudeCliMessage): msg is ClaudeCliStreamEvent {
+  return (
+    isStreamEvent(msg) &&
+    msg.event.type === "content_block_delta" &&
+    msg.event.delta?.type === "thinking_delta"
+  );
+}
+
+export function isRateLimitEvent(msg: ClaudeCliMessage): msg is ClaudeCliRateLimitEvent {
+  return msg.type === "rate_limit_event";
+}
+
+/**
+ * Whether a rate limit notice means the request was refused. The CLI sends
+ * one on every request; the ordinary value is "allowed".
+ */
+export function isRateLimited(event: ClaudeCliRateLimitEvent): boolean {
+  const status = event.rate_limit_info?.status;
+  return typeof status === "string" && !status.startsWith("allowed");
 }
