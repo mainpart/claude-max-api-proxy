@@ -70,10 +70,20 @@ export const PROXY_HOME = path.join(os.homedir(), ".claude-max-api-proxy");
 
 export const DEFAULT_CONFIG_PATH = path.join(PROXY_HOME, "config.json");
 
+/**
+ * Working directory the proxy gives the CLI unless told otherwise.
+ *
+ * A dedicated empty directory means: the proxy's transcripts stay out of the
+ * user's interactive sessions, there is no CLAUDE.md or git status to pull
+ * into the context, and a run with tools enabled cannot wander into whatever
+ * repository the proxy happened to be started from.
+ */
+export const DEFAULT_WORKSPACE = path.join(PROXY_HOME, "workspace");
+
 export const DEFAULTS: ProxyConfig = {
   port: 3456,
   host: "127.0.0.1",
-  cwd: "inherit",
+  cwd: DEFAULT_WORKSPACE,
   timeoutMs: 900_000,
   preset: "agent",
   tools: null,

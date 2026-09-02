@@ -1,17 +1,20 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
   ConfigError,
   DEFAULTS,
+  DEFAULT_WORKSPACE,
   assertSafeArgs,
   parseArgv,
   readEnvLayer,
   resolveConfig,
+  resolveCwd,
   splitArgs,
 } from "./config.js";
+
 
 describe("config", () => {
   let dir: string;
@@ -126,5 +129,35 @@ describe("config", () => {
   it("splits quoted argument strings", () => {
     assert.deepEqual(splitArgs('--a "one two" --b \'three\''), ["--a", "one two", "--b", "three"]);
     assert.deepEqual(splitArgs("   "), []);
+  });
+});
+
+describe("workspace", () => {
+  let dir: string;
+
+  before(async () => {
+    dir = await mkdtemp(path.join(tmpdir(), "claude-proxy-workspace-"));
+  });
+
+  after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("defaults the subprocess cwd to a directory the proxy owns", () => {
+    const config = resolveConfig({ argv: [], env: {}, skipFile: true });
+    assert.equal(config.cwd, DEFAULT_WORKSPACE);
+    assert.notEqual(config.cwd, "inherit");
+  });
+
+  it("still allows the old behaviour explicitly", () => {
+    const config = resolveConfig({ argv: ["--cwd", "inherit"], env: {}, skipFile: true });
+    assert.equal(resolveCwd(config), process.cwd());
+  });
+
+  it("creates the working directory it hands to the CLI", async () => {
+    const target = path.join(dir, "nested", "workspace");
+    const config = resolveConfig({ argv: ["--cwd", target], env: {}, skipFile: true });
+    assert.equal(resolveCwd(config), target);
+    await stat(target);
   });
 });
