@@ -7,13 +7,20 @@
 import type { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import { ClaudeSubprocess } from "../subprocess/manager.js";
-import { openaiToCli, openaiToCliDelta } from "../adapter/openai-to-cli.js";
+import {
+  InvalidRequestError,
+  openaiToCli,
+  openaiToCliDelta,
+  responseFormatInstruction,
+  responseFormatSchema,
+} from "../adapter/openai-to-cli.js";
 import {
   cliResultToOpenai,
   createDoneChunk,
   extractTextContent,
   finishReasonFromResult,
   resolveResponseModel,
+  unwrapJsonFence,
   usageFromResult,
 } from "../adapter/cli-to-openai.js";
 import { getSession, setSession, clearSession } from "../subprocess/session-store.js";
@@ -33,6 +40,46 @@ interface SessionContext {
   sessionKey: string | undefined;
   resume: boolean;
   messageCount: number;
+}
+
+/**
+ * What `response_format` asked for, in the terms the CLI understands.
+ *
+ * The two routes are quite different. A schema becomes a `--json-schema`
+ * flag, which the CLI implements as a StructuredOutput tool: the JSON then
+ * arrives as tool arguments while the text channel carries incidental prose.
+ * `json_object` has no flag at all, so it becomes wording in the system
+ * prompt and the answer arrives as ordinary text — possibly inside a code
+ * fence the model added on its own.
+ */
+interface JsonMode {
+  /** Serialised schema for --json-schema. */
+  schema?: string;
+  /** Wording appended to the system prompt. */
+  systemSuffix?: string;
+  /** Hold the text back so a code fence can be stripped before sending it. */
+  bufferText: boolean;
+}
+
+function resolveJsonMode(body: OpenAIChatRequest): JsonMode {
+  return {
+    schema: responseFormatSchema(body.response_format),
+    systemSuffix: responseFormatInstruction(body.response_format),
+    bufferText: body.response_format?.type === "json_object",
+  };
+}
+
+/** Text of a finished answer, whichever route produced it. */
+function contentFromResult(
+  result: ClaudeCliResult,
+  jsonMode: JsonMode,
+  fallback: string
+): string {
+  if (jsonMode.schema && result.structured_output !== undefined) {
+    return JSON.stringify(result.structured_output);
+  }
+  const raw = result.result || fallback;
+  return jsonMode.bufferText ? unwrapJsonFence(raw) : raw;
 }
 
 /**
@@ -92,15 +139,30 @@ export async function handleChatCompletions(
       return;
     }
 
+    let jsonMode: JsonMode;
+    try {
+      jsonMode = resolveJsonMode(body);
+    } catch (error) {
+      if (!(error instanceof InvalidRequestError)) throw error;
+      res.status(400).json({
+        error: {
+          message: error.message,
+          type: "invalid_request_error",
+          code: "invalid_response_format",
+        },
+      });
+      return;
+    }
+
     // Convert to CLI input format, resuming a persisted session when we have one
     const { cliInput, sessionKey, resume } = resolveCliInput(body);
     const subprocess = new ClaudeSubprocess(config);
     const sessionCtx: SessionContext = { sessionKey, resume, messageCount: body.messages.length };
 
     if (stream) {
-      await handleStreamingResponse(res, subprocess, cliInput, requestId, sessionCtx, config, body);
+      await handleStreamingResponse(res, subprocess, cliInput, requestId, sessionCtx, config, body, jsonMode);
     } else {
-      await handleNonStreamingResponse(res, subprocess, cliInput, requestId, sessionCtx, config, body);
+      await handleNonStreamingResponse(res, subprocess, cliInput, requestId, sessionCtx, config, body, jsonMode);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
@@ -257,7 +319,8 @@ async function handleStreamingResponse(
   requestId: string,
   sessionCtx: SessionContext,
   config: ProxyConfig,
-  body: OpenAIChatRequest
+  body: OpenAIChatRequest,
+  jsonMode: JsonMode
 ): Promise<void> {
   const sse = new SseStream(res, config.streaming.headerFlushMs);
 
@@ -267,6 +330,8 @@ async function handleStreamingResponse(
     let isComplete = false;
     let hasEmittedText = false;
     let settled = false;
+    let inStructuredOutput = false;
+    let buffered = "";
 
     const model = () => resolveResponseModel(body.model, cliModel);
 
@@ -342,6 +407,7 @@ async function handleStreamingResponse(
     // When a new text content block starts after we've already emitted text,
     // insert a separator so text from different blocks doesn't run together
     subprocess.on("text_block_start", () => {
+      if (jsonMode.schema || jsonMode.bufferText) return;
       if (hasEmittedText) sse.send(chunk({ content: "\n\n" }));
     });
 
@@ -349,8 +415,39 @@ async function handleStreamingResponse(
     subprocess.on("content_delta", (event: ClaudeCliStreamEvent) => {
       const text = deltaString(event, "text_delta", "text");
       if (!text) return;
+
+      // With a schema in play the text channel carries the model's prose
+      // about the answer, while the answer itself arrives as tool arguments.
+      if (jsonMode.schema) return;
+
+      // A fence can only be stripped once the whole value is in hand.
+      if (jsonMode.bufferText) {
+        buffered += text;
+        return;
+      }
+
       sse.send(chunk({ content: text }));
       hasEmittedText = true;
+    });
+
+    // The JSON of a --json-schema answer streams as the arguments of the
+    // StructuredOutput tool call.
+    subprocess.on("tool_use_start", (event: ClaudeCliStreamEvent) => {
+      const block = event.event.content_block;
+      inStructuredOutput =
+        Boolean(jsonMode.schema) && block?.type === "tool_use" && block.name === "StructuredOutput";
+    });
+
+    subprocess.on("input_json_delta", (event: ClaudeCliStreamEvent) => {
+      if (!inStructuredOutput) return;
+      const partial = deltaString(event, "input_json_delta", "partial_json");
+      if (!partial) return;
+      sse.send(chunk({ content: partial }));
+      hasEmittedText = true;
+    });
+
+    subprocess.on("content_block_stop", () => {
+      inStructuredOutput = false;
     });
 
     subprocess.on("result", (result: ClaudeCliResult) => {
@@ -359,12 +456,25 @@ async function handleStreamingResponse(
         setSession(sessionCtx.sessionKey, cliInput.sessionId, sessionCtx.messageCount);
       }
 
+      // Held-back text (json_object) goes out here, fence removed.
+      if (jsonMode.bufferText) {
+        const content = contentFromResult(result, jsonMode, buffered);
+        if (content) {
+          sse.send(chunk({ content }));
+          hasEmittedText = true;
+        }
+      }
+
       // A CLI that produced no partial messages — an older build, or one
       // whose answer arrived in a single block — would otherwise leave the
-      // client with an empty stream.
-      if (!hasEmittedText && result.result) {
-        sse.send(chunk({ content: result.result }));
-        hasEmittedText = true;
+      // client with an empty stream. The same fallback covers a schema run
+      // whose StructuredOutput call never streamed.
+      if (!hasEmittedText) {
+        const content = contentFromResult(result, jsonMode, "");
+        if (content) {
+          sse.send(chunk({ content }));
+          hasEmittedText = true;
+        }
       }
 
       const doneChunk = createDoneChunk(requestId, model(), finishReasonFromResult(result));
@@ -409,6 +519,8 @@ async function handleStreamingResponse(
         model: cliInput.model,
         sessionId: cliInput.sessionId,
         resume: sessionCtx.resume,
+        jsonSchema: jsonMode.schema,
+        systemSuffix: jsonMode.systemSuffix,
       })
       .catch((err: Error) => {
         console.error("[Streaming] Subprocess start error:", err.message);
@@ -428,7 +540,8 @@ async function handleNonStreamingResponse(
   requestId: string,
   sessionCtx: SessionContext,
   config: ProxyConfig,
-  body: OpenAIChatRequest
+  body: OpenAIChatRequest,
+  jsonMode: JsonMode
 ): Promise<void> {
   return new Promise((resolve) => {
     let responded = false;
@@ -474,7 +587,11 @@ async function handleNonStreamingResponse(
       if (sessionCtx.sessionKey && cliInput.sessionId) {
         setSession(sessionCtx.sessionKey, cliInput.sessionId, sessionCtx.messageCount);
       }
-      const content = result.result || (lastAssistant ? extractTextContent(lastAssistant) : "");
+      const content = contentFromResult(
+        result,
+        jsonMode,
+        lastAssistant ? extractTextContent(lastAssistant) : ""
+      );
       respond(() => {
         res.json(cliResultToOpenai(result, requestId, { model: body.model, content }));
       });
@@ -519,6 +636,8 @@ async function handleNonStreamingResponse(
         model: cliInput.model,
         sessionId: cliInput.sessionId,
         resume: sessionCtx.resume,
+        jsonSchema: jsonMode.schema,
+        systemSuffix: jsonMode.systemSuffix,
       })
       .catch((error: Error) => {
         respond(() => {

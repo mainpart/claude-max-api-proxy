@@ -403,6 +403,63 @@ export const SPLIT_JSON_LINE: FixtureSpec = (() => {
   };
 })();
 
+/**
+ * A --json-schema run: prose in the text channel, the answer as
+ * StructuredOutput tool arguments, both `result` and `structured_output` set.
+ */
+export const SCHEMA_STREAM: FixtureSpec = {
+  chunks: linesToChunks([
+    initEvent(),
+    messageStart(),
+    textBlockStart(0),
+    textDelta("The capital of France is Paris.", 0),
+    blockStop(0),
+    toolUseBlockStart("StructuredOutput", 0),
+    inputJsonDelta("", 0),
+    inputJsonDelta('{"city": "Paris', 0),
+    inputJsonDelta('", "population": 2100000', 0),
+    inputJsonDelta("}", 0),
+    blockStop(0),
+    {
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          {
+            tool_use_id: "toolu_fixture",
+            type: "tool_result",
+            content: "Structured output provided successfully",
+          },
+        ],
+      },
+      ...base,
+    },
+    messageDelta("tool_use"),
+    messageStop(),
+    resultMessage({
+      result: '{"city":"Paris","population":2100000}',
+      structured_output: { city: "Paris", population: 2100000 },
+      num_turns: 2,
+      stop_reason: "tool_use",
+    }),
+  ]),
+};
+
+/** A json_object answer the model wrapped in a Markdown fence on its own. */
+export const FENCED_JSON: FixtureSpec = {
+  chunks: linesToChunks([
+    initEvent(),
+    messageStart(),
+    textBlockStart(),
+    textDelta('```json\n{"city": "Paris"'),
+    textDelta("}\n```"),
+    blockStop(),
+    messageDelta(),
+    messageStop(),
+    resultMessage({ result: '```json\n{"city": "Paris"}\n```' }),
+  ]),
+};
+
 /** Minimal successful run — used when the test only cares about argv/stdin. */
 export const RESUME_ECHO: FixtureSpec = {
   chunks: linesToChunks([initEvent(), resultMessage({ result: "ok" })]),

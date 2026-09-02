@@ -24,6 +24,26 @@ export function extractTextContent(message: ClaudeCliAssistant): string {
 }
 
 /**
+ * Strip a Markdown code fence from around a JSON answer.
+ *
+ * Needed on the `json_object` path, where the model is asked in words and
+ * often wraps the result anyway. The fence is removed only when what is
+ * inside it parses as JSON, so prose that merely contains a fence survives
+ * untouched. On the `json_schema` path there is nothing to strip — the JSON
+ * arrives as tool arguments.
+ */
+export function unwrapJsonFence(text: string): string {
+  const match = text.match(/^\s*```(?:json|jsonc)?\s*\r?\n([\s\S]*?)\r?\n?\s*```\s*$/i);
+  if (!match) return text;
+  try {
+    JSON.parse(match[1]);
+    return match[1];
+  } catch {
+    return text;
+  }
+}
+
+/**
  * Convert Claude CLI assistant message to OpenAI streaming chunk
  */
 export function cliToOpenaiChunk(

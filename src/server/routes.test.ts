@@ -16,12 +16,14 @@ import {
   textBlockStart,
   textDelta,
   ERROR_EXIT,
+  FENCED_JSON,
   FIXTURE_MODEL,
   HAPPY_TEXT,
   MULTI_TEXT_BLOCKS,
   NO_PARTIAL_MESSAGES,
   RATE_LIMIT,
   RESUME_ECHO,
+  SCHEMA_STREAM,
   SPLIT_JSON_LINE,
   THINKING_THEN_TEXT,
   type FixtureCli,
@@ -462,5 +464,159 @@ describe("streaming defects", () => {
     await waitFor(async () => (await countFixtureProcesses()) <= before, 5_000);
     assert.ok((await countFixtureProcesses()) <= before);
     await startWith();
+  });
+});
+
+describe("response_format", () => {
+  before(async () => {
+    fixture = await createFixtureCli();
+    sandbox = await mkdtemp(path.join(tmpdir(), "claude-proxy-format-"));
+
+    previousConfig = process.env.CLAUDE_PROXY_CONFIG;
+    const emptyConfig = path.join(sandbox, "config.json");
+    await writeFile(emptyConfig, "{}", "utf8");
+    process.env.CLAUDE_PROXY_CONFIG = emptyConfig;
+
+    previousBin = process.env.CLAUDE_BIN;
+    process.env.CLAUDE_BIN = fixture.bin;
+
+    await startWith();
+  });
+
+  after(async () => {
+    await stopServer();
+    if (previousBin === undefined) delete process.env.CLAUDE_BIN;
+    else process.env.CLAUDE_BIN = previousBin;
+    if (previousConfig === undefined) delete process.env.CLAUDE_PROXY_CONFIG;
+    else process.env.CLAUDE_PROXY_CONFIG = previousConfig;
+    await fixture.cleanup();
+    await rm(sandbox, { recursive: true, force: true });
+  });
+
+  const schema = {
+    type: "object",
+    properties: { city: { type: "string" }, population: { type: "integer" } },
+    required: ["city"],
+    additionalProperties: false,
+  };
+  const withSchema = {
+    model: "claude-haiku-4-5",
+    messages: [{ role: "user", content: "capital of France?" }],
+    response_format: { type: "json_schema", json_schema: { name: "city", strict: true, schema } },
+  };
+
+  it("passes the inner schema to --json-schema, unwrapped", async () => {
+    await fixture.use(SCHEMA_STREAM);
+    await chat(withSchema);
+
+    const record = await fixture.record();
+    const flag = record.argv.indexOf("--json-schema");
+    assert.ok(flag >= 0, "expected --json-schema");
+    assert.deepEqual(JSON.parse(record.argv[flag + 1]), schema);
+  });
+
+  it("returns structured_output rather than reparsing the result text", async () => {
+    await fixture.use(SCHEMA_STREAM);
+    const { json } = await chat(withSchema);
+    assert.deepEqual(JSON.parse(json.choices[0].message.content), {
+      city: "Paris",
+      population: 2100000,
+    });
+  });
+
+  it("survives a result with no structured_output", async () => {
+    await fixture.use({
+      chunks: linesToChunks([
+        initEvent(),
+        resultMessage({ result: '{"city":"Paris"}' }),
+      ]),
+    });
+    const { status, json } = await chat(withSchema);
+    assert.equal(status, 200);
+    assert.equal(json.choices[0].message.content, '{"city":"Paris"}');
+  });
+
+  it("streams the JSON, not the prose that accompanies it", async () => {
+    await fixture.use(SCHEMA_STREAM);
+    const { text, sawDone } = await chatStream(withSchema);
+    assert.deepEqual(JSON.parse(text), { city: "Paris", population: 2100000 });
+    assert.ok(sawDone);
+    assert.doesNotMatch(text, /capital of France/);
+  });
+
+  it("adds no schema flag and no instruction without response_format", async () => {
+    await fixture.use(RESUME_ECHO);
+    await chat({ model: "claude-haiku-4-5", messages: [{ role: "user", content: "hi" }] });
+
+    const record = await fixture.record();
+    assert.ok(!record.argv.includes("--json-schema"));
+    const appended = record.argv[record.argv.indexOf("--append-system-prompt") + 1];
+    assert.doesNotMatch(appended, /single JSON value/);
+  });
+
+  it("carries the json_object rule in the system prompt, not the turn text", async () => {
+    await fixture.use(FENCED_JSON);
+    await chat({
+      model: "claude-haiku-4-5",
+      messages: [{ role: "user", content: "capital of France?" }],
+      response_format: { type: "json_object" },
+    });
+
+    const record = await fixture.record();
+    assert.ok(!record.argv.includes("--json-schema"));
+    const appended = record.argv[record.argv.indexOf("--append-system-prompt") + 1];
+    assert.match(appended, /single JSON value/);
+    assert.doesNotMatch(record.stdin, /single JSON value/);
+  });
+
+  it("strips a code fence the model added around a json_object answer", async () => {
+    await fixture.use(FENCED_JSON);
+    const body = {
+      model: "claude-haiku-4-5",
+      messages: [{ role: "user", content: "capital of France?" }],
+      response_format: { type: "json_object" as const },
+    };
+
+    const { json } = await chat(body);
+    assert.deepEqual(JSON.parse(json.choices[0].message.content), { city: "Paris" });
+
+    await fixture.use(FENCED_JSON);
+    const streamed = await chatStream(body);
+    assert.deepEqual(JSON.parse(streamed.text), { city: "Paris" });
+  });
+
+  it("leaves prose alone when the fence does not wrap valid JSON", async () => {
+    const notJson = "```json\nnot really json\n```";
+    await fixture.use({
+      chunks: linesToChunks([initEvent(), resultMessage({ result: notJson })]),
+    });
+    const { json } = await chat({
+      model: "claude-haiku-4-5",
+      messages: [{ role: "user", content: "hi" }],
+      response_format: { type: "json_object" },
+    });
+    assert.equal(json.choices[0].message.content, notJson);
+  });
+
+  it("rejects a malformed json_schema with 400 instead of a silent plain answer", async () => {
+    const { status, json } = await chat({
+      model: "claude-haiku-4-5",
+      messages: [{ role: "user", content: "hi" }],
+      response_format: { type: "json_schema", json_schema: { name: "x" } },
+    });
+    assert.equal(status, 400);
+    assert.equal(json.error.code, "invalid_response_format");
+  });
+
+  it("treats {\"type\":\"text\"} as the default", async () => {
+    await fixture.use(HAPPY_TEXT);
+    const { json } = await chat({
+      model: "claude-haiku-4-5",
+      messages: [{ role: "user", content: "hi" }],
+      response_format: { type: "text" },
+    });
+    assert.equal(json.choices[0].message.content, "Hello there");
+    const record = await fixture.record();
+    assert.ok(!record.argv.includes("--json-schema"));
   });
 });

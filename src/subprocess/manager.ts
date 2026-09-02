@@ -44,6 +44,10 @@ export interface SubprocessOptions {
   cwd?: string;
   /** Overrides `config.timeoutMs` for this run. */
   timeout?: number;
+  /** Serialised JSON Schema for `--json-schema`. */
+  jsonSchema?: string;
+  /** Extra wording appended to the system prompt for this request. */
+  systemSuffix?: string;
 }
 
 export interface SubprocessEvents {
@@ -345,7 +349,11 @@ export class ClaudeSubprocess extends EventEmitter {
       // Prompt is passed via stdin (avoids E2BIG on large inputs)
     ];
 
-    args.push(...this.presetArgs());
+    if (options.jsonSchema) {
+      args.push("--json-schema", options.jsonSchema);
+    }
+
+    args.push(...this.presetArgs(options));
 
     if (this.config.tools !== null) {
       args.push("--tools", this.config.tools);
@@ -370,11 +378,15 @@ export class ClaudeSubprocess extends EventEmitter {
   }
 
   /** Flags contributed by the active preset. */
-  private presetArgs(): string[] {
+  private presetArgs(options: SubprocessOptions): string[] {
+    const appended = [OPENCLAW_TOOL_MAPPING_PROMPT, options.systemSuffix]
+      .filter(Boolean)
+      .join("\n\n");
+
     return [
       "--dangerously-skip-permissions", // Skip permission prompts
       "--append-system-prompt",
-      OPENCLAW_TOOL_MAPPING_PROMPT,
+      appended,
     ];
   }
 

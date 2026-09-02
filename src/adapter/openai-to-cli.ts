@@ -2,7 +2,14 @@
  * Converts OpenAI chat request format to Claude CLI input
  */
 
-import type { OpenAIChatRequest, OpenAIContentBlock } from "../types/openai.js";
+import type {
+  OpenAIChatRequest,
+  OpenAIContentBlock,
+  OpenAIResponseFormat,
+} from "../types/openai.js";
+
+/** A request the proxy refuses before spawning anything. */
+export class InvalidRequestError extends Error {}
 
 export type ClaudeModel = "opus" | "sonnet" | "haiku";
 
@@ -10,6 +17,63 @@ export interface CliInput {
   prompt: string;
   model: ClaudeModel;
   sessionId?: string;
+}
+
+/**
+ * Instruction used for `response_format: {"type":"json_object"}`.
+ *
+ * There is no CLI flag for it: `--json-schema` needs a schema, and the
+ * permissive `{"type":"object"}` comes back as an empty `{}`. So the rule is
+ * worded instead — and it belongs in the system prompt, because
+ * `response_format` describes one request, not the conversation. Put in the
+ * turn text it would settle into the history and keep applying to later turns
+ * that never asked for JSON.
+ */
+export const JSON_OBJECT_INSTRUCTION =
+  "Reply with a single JSON value and nothing else: no prose before or after it, and no Markdown code fence.";
+
+/**
+ * Serialised schema for `--json-schema`, or undefined when the request did
+ * not ask for one.
+ *
+ * Nothing is added to the prompt alongside it. The CLI implements the flag as
+ * a tool named StructuredOutput whose description already tells the model to
+ * call it exactly once at the end, and a request body carrying a schema
+ * differs from one without it only in the `tools` array.
+ */
+export function responseFormatSchema(
+  format: OpenAIResponseFormat | undefined
+): string | undefined {
+  if (!format || format.type !== "json_schema") return undefined;
+
+  const schema = format.json_schema?.schema;
+  if (typeof schema !== "object" || schema === null || Array.isArray(schema)) {
+    throw new InvalidRequestError(
+      "response_format.json_schema.schema must be a JSON Schema object"
+    );
+  }
+
+  // An invalid schema used to reach the CLI and come back as a quietly
+  // unstructured answer rather than an error.
+  let serialised: string;
+  try {
+    serialised = JSON.stringify(schema);
+  } catch {
+    throw new InvalidRequestError("response_format.json_schema.schema is not serialisable");
+  }
+  return serialised;
+}
+
+/** Wording for `json_object`, which has no flag to carry it. */
+export function responseFormatInstruction(
+  format: OpenAIResponseFormat | undefined
+): string | undefined {
+  return format?.type === "json_object" ? JSON_OBJECT_INSTRUCTION : undefined;
+}
+
+/** Whether the client is expecting JSON back, by either route. */
+export function wantsJson(format: OpenAIResponseFormat | undefined): boolean {
+  return format?.type === "json_object" || format?.type === "json_schema";
 }
 
 const MODEL_MAP: Record<string, ClaudeModel> = {

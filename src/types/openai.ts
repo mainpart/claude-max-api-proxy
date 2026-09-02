@@ -13,10 +13,33 @@ export interface OpenAIChatMessage {
   content: string | OpenAIContentBlock[];
 }
 
+/**
+ * Shapes accepted in `response_format`. `json_schema.name` and
+ * `json_schema.strict` are parsed but unused — the CLI takes a bare schema
+ * and has nowhere to put them.
+ */
+export type OpenAIResponseFormat =
+  | { type: "text" }
+  | { type: "json_object" }
+  | {
+      type: "json_schema";
+      json_schema: {
+        name?: string;
+        strict?: boolean;
+        schema: Record<string, unknown>;
+      };
+    };
+
+export interface OpenAIStreamOptions {
+  include_usage?: boolean;
+}
+
 export interface OpenAIChatRequest {
   model: string;
   messages: OpenAIChatMessage[];
   stream?: boolean;
+  stream_options?: OpenAIStreamOptions;
+  response_format?: OpenAIResponseFormat;
   temperature?: number;
   max_tokens?: number;
   top_p?: number;
