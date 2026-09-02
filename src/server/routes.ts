@@ -23,8 +23,14 @@ import {
   unwrapJsonFence,
   usageFromResult,
 } from "../adapter/cli-to-openai.js";
-import { getSession, setSession, clearSession } from "../subprocess/session-store.js";
-import type { OpenAIChatRequest, OpenAIChatChunk, OpenAIChatChunkDelta } from "../types/openai.js";
+import { getSessionIndex, type SessionIndex } from "../subprocess/session-store.js";
+import { lookupKeys, profileHash, storeKeys } from "../session/key.js";
+import type {
+  OpenAIChatMessage,
+  OpenAIChatRequest,
+  OpenAIChatChunk,
+  OpenAIChatChunkDelta,
+} from "../types/openai.js";
 import type {
   ClaudeCliAssistant,
   ClaudeCliInit,
@@ -37,9 +43,42 @@ import type { ProxyConfig } from "../config.js";
 import { DEFAULTS } from "../config.js";
 
 interface SessionContext {
-  sessionKey: string | undefined;
+  /** Session id handed to the CLI for this run. */
+  sessionId: string;
+  /** Session id the CLI reported; it is free to choose a different one. */
+  realSessionId?: string;
   resume: boolean;
-  messageCount: number;
+  /** `user:<value>`, when the client sent one. */
+  userKey?: string;
+  /** Identity of the configuration, so a config change is a session miss. */
+  profile: string;
+  messages: OpenAIChatMessage[];
+  index: SessionIndex;
+  release: () => void;
+}
+
+/** Record a finished turn under every key the next request might look up. */
+function rememberSession(session: SessionContext, answer: string): void {
+  const keys = storeKeys(session.messages, answer);
+  session.index.set(
+    [
+      session.userKey,
+      keys.anchor ? `anchor:${keys.anchor}` : undefined,
+      `prefix:${keys.prefix}`,
+    ],
+    {
+      claudeSessionId: session.realSessionId ?? session.sessionId,
+      messageCount: keys.messageCount,
+      profileHash: session.profile,
+    }
+  );
+}
+
+/** Forget a session whose resume failed, so the next turn starts clean. */
+function forgetSession(session: SessionContext): void {
+  if (!session.resume) return;
+  session.index.clear(session.sessionId);
+  session.index.clear(session.userKey);
 }
 
 /**
@@ -84,35 +123,85 @@ function contentFromResult(
 
 /**
  * Resolve CLI input for a request, resuming a persisted Claude CLI session
- * when we have one for this `request.user` key instead of replaying the
- * full message history on every turn.
+ * when one already holds this conversation.
+ *
+ * Resume used to depend on `request.user`. That field is optional in the
+ * OpenAI API and most clients omit it, so in practice the proxy replayed the
+ * whole history as a fresh prompt on every turn and the cache never hit. The
+ * conversation is now identified from the messages themselves.
  */
-function resolveCliInput(
+async function resolveCliInput(
   body: OpenAIChatRequest,
-  preset: ProxyConfig["preset"]
-): {
-  cliInput: ReturnType<typeof openaiToCli>;
-  sessionKey: string | undefined;
-  resume: boolean;
-} {
-  // Session resume requires a stable per-client identifier. Without `user`
-  // we have no way to distinguish callers, so skip resume entirely rather
-  // than fall back to a shared key that would cross-contaminate unrelated
-  // conversations.
-  const sessionKey = body.user;
-  const existing = sessionKey ? getSession(sessionKey) : undefined;
+  config: ProxyConfig,
+  index: SessionIndex
+): Promise<{ cliInput: ReturnType<typeof openaiToCli>; session: SessionContext }> {
+  const profile = profileHash({
+    cwd: config.cwd,
+    tools: config.tools,
+    preset: config.preset,
+    extraArgs: config.extraArgs,
+  });
+  const userKey = body.user ? `user:${body.user}` : undefined;
+  const keys = lookupKeys(body.messages);
+  const strategies = new Set(config.sessionStrategy);
 
-  if (existing) {
-    const cliInput = openaiToCliDelta(body, existing.messageCount, preset);
-    cliInput.sessionId = existing.claudeSessionId;
-    return { cliInput, sessionKey, resume: true };
+  const candidates: Array<{ key: string; sinceIndex?: number }> = [];
+  if (userKey && strategies.has("user")) candidates.push({ key: userKey });
+  if (keys.anchor && strategies.has("anchor")) {
+    candidates.push({ key: `anchor:${keys.anchor}`, sinceIndex: keys.anchorIndex });
+  }
+  if (keys.prefix && strategies.has("prefix")) candidates.push({ key: `prefix:${keys.prefix}` });
+
+  for (const candidate of candidates) {
+    const entry = index.get(candidate.key);
+    // A session created under different flags would answer in a different
+    // shape; treat a configuration change as a miss rather than resume into it.
+    if (!entry || entry.profileHash !== profile) continue;
+
+    // Two requests must not append to one transcript at the same time. On a
+    // busy session, answering from a fresh one beats queueing behind it.
+    const release = await index.acquire(entry.claudeSessionId, config.sessionLockTimeoutMs);
+    if (!release) break;
+
+    const cliInput = openaiToCliDelta(
+      body,
+      candidate.sinceIndex ?? entry.messageCount,
+      config.preset
+    );
+    cliInput.sessionId = entry.claudeSessionId;
+
+    return {
+      cliInput,
+      session: {
+        sessionId: entry.claudeSessionId,
+        resume: true,
+        userKey,
+        profile,
+        messages: body.messages,
+        index,
+        release,
+      },
+    };
   }
 
-  const cliInput = openaiToCli(body, preset);
-  if (sessionKey) {
-    cliInput.sessionId = uuidv4(); // pin a known ID so we can --resume it later
-  }
-  return { cliInput, sessionKey, resume: false };
+  const cliInput = openaiToCli(body, config.preset);
+  const sessionId = uuidv4(); // pin a known ID so we can --resume it later
+  cliInput.sessionId = sessionId;
+
+  const release = (await index.acquire(sessionId, config.sessionLockTimeoutMs)) ?? (() => {});
+
+  return {
+    cliInput,
+    session: {
+      sessionId,
+      resume: false,
+      userKey,
+      profile,
+      messages: body.messages,
+      index,
+      release,
+    },
+  };
 }
 
 /**
@@ -158,14 +247,21 @@ export async function handleChatCompletions(
     }
 
     // Convert to CLI input format, resuming a persisted session when we have one
-    const { cliInput, sessionKey, resume } = resolveCliInput(body, config.preset);
+    const index = getSessionIndex(config.sessionIndexPath);
+    const { cliInput, session } = await resolveCliInput(body, config, index);
     const subprocess = new ClaudeSubprocess(config);
-    const sessionCtx: SessionContext = { sessionKey, resume, messageCount: body.messages.length };
 
-    if (stream) {
-      await handleStreamingResponse(res, subprocess, cliInput, requestId, sessionCtx, config, body, jsonMode);
-    } else {
-      await handleNonStreamingResponse(res, subprocess, cliInput, requestId, sessionCtx, config, body, jsonMode);
+    try {
+      if (stream) {
+        await handleStreamingResponse(res, subprocess, cliInput, requestId, session, config, body, jsonMode);
+      } else {
+        await handleNonStreamingResponse(res, subprocess, cliInput, requestId, session, config, body, jsonMode);
+      }
+    } finally {
+      // Hold the session while the CLI finishes writing its transcript — that
+      // file is what the next --resume reads.
+      const unlock = setTimeout(session.release, config.streaming.resultGraceMs);
+      unlock.unref();
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
@@ -320,7 +416,7 @@ async function handleStreamingResponse(
   subprocess: ClaudeSubprocess,
   cliInput: ReturnType<typeof openaiToCli>,
   requestId: string,
-  sessionCtx: SessionContext,
+  session: SessionContext,
   config: ProxyConfig,
   body: OpenAIChatRequest,
   jsonMode: JsonMode
@@ -381,6 +477,9 @@ async function handleStreamingResponse(
     // arrives after the deltas it is supposed to describe.
     subprocess.on("init", (msg: ClaudeCliInit) => {
       cliModel = msg.model ?? cliModel;
+      // Record the id the CLI actually used, not the one we proposed: the two
+      // differ if it declines ours, and only the real one can be resumed.
+      session.realSessionId = msg.session_id ?? session.realSessionId;
     });
 
     subprocess.on("message_start", (event: ClaudeCliStreamEvent) => {
@@ -455,9 +554,7 @@ async function handleStreamingResponse(
 
     subprocess.on("result", (result: ClaudeCliResult) => {
       isComplete = true;
-      if (sessionCtx.sessionKey && cliInput.sessionId) {
-        setSession(sessionCtx.sessionKey, cliInput.sessionId, sessionCtx.messageCount);
-      }
+      session.realSessionId = result.session_id ?? session.realSessionId;
 
       // Held-back text (json_object) goes out here, fence removed.
       if (jsonMode.bufferText) {
@@ -480,6 +577,8 @@ async function handleStreamingResponse(
         }
       }
 
+      rememberSession(session, contentFromResult(result, jsonMode, buffered));
+
       const doneChunk = createDoneChunk(requestId, model(), finishReasonFromResult(result));
       if (result.usage) doneChunk.usage = usageFromResult(result);
       sse.send(doneChunk);
@@ -492,9 +591,7 @@ async function handleStreamingResponse(
       console.error("[Streaming] Error:", error.message);
       // Resume may have failed (e.g. stale/missing session) — drop it so the
       // next turn self-heals with a fresh full-history session
-      if (sessionCtx.resume && sessionCtx.sessionKey) {
-        clearSession(sessionCtx.sessionKey);
-      }
+      forgetSession(session);
       sse.fail(statusForError(error.message), error.message);
       finish();
     });
@@ -505,9 +602,7 @@ async function handleStreamingResponse(
         return;
       }
       if (code !== 0) {
-        if (sessionCtx.resume && sessionCtx.sessionKey) {
-          clearSession(sessionCtx.sessionKey);
-        }
+        forgetSession(session);
         sse.fail(statusForError(""), `Claude CLI exited with code ${code} without a result`);
       } else {
         // Clean exit with nothing to say — still terminate the stream.
@@ -521,7 +616,7 @@ async function handleStreamingResponse(
       .start(cliInput.prompt, {
         model: cliInput.model,
         sessionId: cliInput.sessionId,
-        resume: sessionCtx.resume,
+        resume: session.resume,
         jsonSchema: jsonMode.schema,
         systemSuffix: jsonMode.systemSuffix,
         systemPrompt: cliInput.system,
@@ -542,7 +637,7 @@ async function handleNonStreamingResponse(
   subprocess: ClaudeSubprocess,
   cliInput: ReturnType<typeof openaiToCli>,
   requestId: string,
-  sessionCtx: SessionContext,
+  session: SessionContext,
   config: ProxyConfig,
   body: OpenAIChatRequest,
   jsonMode: JsonMode
@@ -588,14 +683,13 @@ async function handleNonStreamingResponse(
     // the process to exit, which on a wedged subprocess meant holding the
     // request open until the 15-minute timeout.
     subprocess.on("result", (result: ClaudeCliResult) => {
-      if (sessionCtx.sessionKey && cliInput.sessionId) {
-        setSession(sessionCtx.sessionKey, cliInput.sessionId, sessionCtx.messageCount);
-      }
+      session.realSessionId = result.session_id ?? session.realSessionId;
       const content = contentFromResult(
         result,
         jsonMode,
         lastAssistant ? extractTextContent(lastAssistant) : ""
       );
+      rememberSession(session, content);
       respond(() => {
         res.json(cliResultToOpenai(result, requestId, { model: body.model, content }));
       });
@@ -605,9 +699,7 @@ async function handleNonStreamingResponse(
 
     subprocess.on("error", (error: Error) => {
       console.error("[NonStreaming] Error:", error.message);
-      if (sessionCtx.resume && sessionCtx.sessionKey) {
-        clearSession(sessionCtx.sessionKey);
-      }
+      forgetSession(session);
       respond(() => {
         res.status(statusForError(error.message)).json({
           error: { message: error.message, type: "server_error", code: null },
@@ -620,9 +712,7 @@ async function handleNonStreamingResponse(
         resolve();
         return;
       }
-      if (sessionCtx.resume && sessionCtx.sessionKey) {
-        clearSession(sessionCtx.sessionKey);
-      }
+      forgetSession(session);
       respond(() => {
         res.status(500).json({
           error: {
@@ -639,7 +729,7 @@ async function handleNonStreamingResponse(
       .start(cliInput.prompt, {
         model: cliInput.model,
         sessionId: cliInput.sessionId,
-        resume: sessionCtx.resume,
+        resume: session.resume,
         jsonSchema: jsonMode.schema,
         systemSuffix: jsonMode.systemSuffix,
         systemPrompt: cliInput.system,

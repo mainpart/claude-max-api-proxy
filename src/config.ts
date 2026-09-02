@@ -18,6 +18,17 @@ import path from "path";
 
 export type Preset = "economy" | "agent";
 
+/**
+ * Ways of matching a request to an existing CLI session, tried in this order.
+ *
+ * - `user`: the OpenAI `user` field, when the client sends one.
+ * - `anchor`: the last assistant message plus the user message before it.
+ * - `prefix`: a hash of the whole history except the last message.
+ * - `scan`: read the CLI's own transcripts, for a cold index.
+ */
+export const SESSION_STRATEGIES = ["user", "anchor", "prefix", "scan"] as const;
+export type SessionStrategy = (typeof SESSION_STRATEGIES)[number];
+
 /** How thinking blocks reach the client. */
 export type ThinkingMode = "drop" | "reasoning_content";
 
@@ -62,6 +73,13 @@ export interface ProxyConfig {
   binArgs: string[];
   /** Where the session index is persisted across proxy restarts. */
   sessionIndexPath: string;
+  /** Which lookups to try, in order. Narrow it for a stricter proxy. */
+  sessionStrategy: SessionStrategy[];
+  /**
+   * How long a request waits for another request on the same session. On
+   * expiry it starts a fresh session with the full history rather than queue.
+   */
+  sessionLockTimeoutMs: number;
   streaming: StreamingConfig;
 }
 
@@ -93,6 +111,8 @@ export const DEFAULTS: ProxyConfig = {
   extraArgs: [],
   binArgs: [],
   sessionIndexPath: path.join(PROXY_HOME, "sessions.json"),
+  sessionStrategy: [...SESSION_STRATEGIES],
+  sessionLockTimeoutMs: 30_000,
   streaming: {
     thinking: "drop",
     headerFlushMs: 1_000,
@@ -175,6 +195,18 @@ function asThinking(value: unknown, source: string): ThinkingMode {
   );
 }
 
+function asStrategies(value: unknown, source: string): SessionStrategy[] {
+  const list = asStringArray(value, source);
+  for (const item of list) {
+    if (!SESSION_STRATEGIES.includes(item as SessionStrategy)) {
+      throw new ConfigError(
+        `${source}: unknown session strategy "${item}"; expected one of ${SESSION_STRATEGIES.join(", ")}`
+      );
+    }
+  }
+  return list as SessionStrategy[];
+}
+
 function asStringArray(value: unknown, source: string): string[] {
   if (!Array.isArray(value) || value.some((v) => typeof v !== "string")) {
     throw new ConfigError(`${source}: expected an array of strings`);
@@ -244,6 +276,12 @@ function validateLayer(raw: Record<string, unknown>, source: string): ConfigLaye
       case "sessionIndexPath":
         layer.sessionIndexPath = asString(value, `${source}.sessionIndexPath`);
         break;
+      case "sessionStrategy":
+        layer.sessionStrategy = asStrategies(value, `${source}.sessionStrategy`);
+        break;
+      case "sessionLockTimeoutMs":
+        layer.sessionLockTimeoutMs = asPositiveInt(value, `${source}.sessionLockTimeoutMs`);
+        break;
       case "streaming": {
         if (typeof value !== "object" || Array.isArray(value)) {
           throw new ConfigError(`${source}.streaming: expected an object`);
@@ -296,7 +334,9 @@ export function loadConfigFile(filePath: string): ConfigLayer {
   return validateLayer(parsed as Record<string, unknown>, `config file ${filePath}`);
 }
 
-const ENV_KEYS: Record<string, keyof ProxyConfig | "streaming.thinking" | "streaming.headerFlushMs" | "streaming.resultGraceMs"> = {
+type EnvTarget = keyof ProxyConfig | "streaming.thinking" | "streaming.headerFlushMs" | "streaming.resultGraceMs";
+
+const ENV_KEYS: Record<string, EnvTarget> = {
   CLAUDE_PROXY_PORT: "port",
   CLAUDE_PROXY_HOST: "host",
   CLAUDE_PROXY_CWD: "cwd",
@@ -306,6 +346,8 @@ const ENV_KEYS: Record<string, keyof ProxyConfig | "streaming.thinking" | "strea
   CLAUDE_PROXY_EXTRA_ARGS: "extraArgs",
   CLAUDE_PROXY_BIN_ARGS: "binArgs",
   CLAUDE_PROXY_SESSION_INDEX: "sessionIndexPath",
+  CLAUDE_PROXY_SESSION_STRATEGY: "sessionStrategy",
+  CLAUDE_PROXY_SESSION_LOCK_MS: "sessionLockTimeoutMs",
   CLAUDE_PROXY_THINKING: "streaming.thinking",
   CLAUDE_PROXY_HEADER_FLUSH_MS: "streaming.headerFlushMs",
   CLAUDE_PROXY_RESULT_GRACE_MS: "streaming.resultGraceMs",
@@ -320,6 +362,8 @@ export function readEnvLayer(env: NodeJS.ProcessEnv = process.env): ConfigLayer 
     if (value === undefined) continue;
     if (target === "extraArgs" || target === "binArgs") {
       raw[target] = splitArgs(value);
+    } else if (target === "sessionStrategy") {
+      raw[target] = value.split(",").map((s) => s.trim()).filter(Boolean);
     } else if (target.startsWith("streaming.")) {
       streaming[target.slice("streaming.".length)] = value;
     } else {
@@ -380,6 +424,10 @@ export function parseArgv(argv: string[]): ArgvResult {
       case "--preset": raw.preset = takeValue(); break;
       case "--tools": raw.tools = takeValue(); break;
       case "--session-index": raw.sessionIndexPath = takeValue(); break;
+      case "--session-strategy":
+        raw.sessionStrategy = takeValue().split(",").map((v) => v.trim()).filter(Boolean);
+        break;
+      case "--session-lock-ms": raw.sessionLockTimeoutMs = takeValue(); break;
       case "--thinking": streaming.thinking = takeValue(); break;
       case "--header-flush-ms": streaming.headerFlushMs = takeValue(); break;
       case "--result-grace-ms": streaming.resultGraceMs = takeValue(); break;

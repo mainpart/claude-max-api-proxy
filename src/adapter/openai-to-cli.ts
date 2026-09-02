@@ -135,7 +135,7 @@ export function extractModel(model: string): ClaudeModel {
  *   - A plain string: "Hello"
  *   - An array of content blocks: [{"type": "text", "text": "Hello"}]
  */
-function extractText(content: string | OpenAIContentBlock[]): string {
+export function extractText(content: string | OpenAIContentBlock[]): string {
   if (typeof content === "string") {
     return content;
   }

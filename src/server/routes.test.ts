@@ -6,6 +6,7 @@ import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import { after, before, beforeEach, describe, it } from "node:test";
 import { startServer, stopServer } from "./index.js";
+import { resetSessionIndexes } from "../subprocess/session-store.js";
 import type { ServerConfig } from "./index.js";
 import {
   createFixtureCli,
@@ -17,6 +18,7 @@ import {
   textDelta,
   ERROR_EXIT,
   FENCED_JSON,
+  FIXTURE_SESSION_ID,
   FIXTURE_MODEL,
   HAPPY_TEXT,
   MULTI_TEXT_BLOCKS,
@@ -39,7 +41,13 @@ let previousConfig: string | undefined;
 
 /** Everything the fixture needs to stand in for the real CLI. */
 function testConfig(overrides: ServerConfig = {}): ServerConfig {
-  return { port: 0, binArgs: fixture.binArgs, cwd: sandbox, ...overrides };
+  return {
+    port: 0,
+    binArgs: fixture.binArgs,
+    cwd: sandbox,
+    sessionIndexPath: path.join(sandbox, "sessions.json"),
+    ...overrides,
+  };
 }
 
 async function startWith(overrides: ServerConfig = {}): Promise<void> {
@@ -237,7 +245,10 @@ describe("chat completions over a fixture CLI", () => {
     });
 
     const secondRecord = await fixture.record();
-    assert.deepEqual(secondRecord.argv.slice(-2), ["--resume", sessionId]);
+    // The id recorded is the one the CLI reported, not the one we proposed:
+    // only that one can actually be resumed.
+    assert.notEqual(sessionId, FIXTURE_SESSION_ID);
+    assert.deepEqual(secondRecord.argv.slice(-2), ["--resume", FIXTURE_SESSION_ID]);
     assert.match(secondRecord.stdin, /second question/);
     assert.doesNotMatch(secondRecord.stdin, /first question/);
   });
@@ -704,6 +715,181 @@ describe("economy preset over HTTP", () => {
     const record = await fixture.record();
     assert.ok(!record.argv.includes("--system-prompt"));
     assert.match(record.stdin, /<system>\s*You are a pirate\./);
+    await startWith();
+  });
+});
+
+describe("session lookup without `user`", () => {
+  before(async () => {
+    fixture = await createFixtureCli();
+    sandbox = await mkdtemp(path.join(tmpdir(), "claude-proxy-session-"));
+
+    previousConfig = process.env.CLAUDE_PROXY_CONFIG;
+    const emptyConfig = path.join(sandbox, "config.json");
+    await writeFile(emptyConfig, "{}", "utf8");
+    process.env.CLAUDE_PROXY_CONFIG = emptyConfig;
+
+    previousBin = process.env.CLAUDE_BIN;
+    process.env.CLAUDE_BIN = fixture.bin;
+
+    await startWith();
+  });
+
+  after(async () => {
+    await stopServer();
+    if (previousBin === undefined) delete process.env.CLAUDE_BIN;
+    else process.env.CLAUDE_BIN = previousBin;
+    if (previousConfig === undefined) delete process.env.CLAUDE_PROXY_CONFIG;
+    else process.env.CLAUDE_PROXY_CONFIG = previousConfig;
+    await fixture.cleanup();
+    await rm(sandbox, { recursive: true, force: true });
+  });
+
+  const model = "claude-haiku-4-5";
+
+  it("resumes a conversation the client never labelled", async () => {
+    await fixture.use({
+      chunks: linesToChunks([initEvent(), resultMessage({ result: "first answer" })]),
+    });
+    await chat({ model, messages: [{ role: "user", content: "first question" }] });
+
+    await fixture.use(RESUME_ECHO);
+    await chat({
+      model,
+      messages: [
+        { role: "user", content: "first question" },
+        { role: "assistant", content: "first answer" },
+        { role: "user", content: "second question" },
+      ],
+    });
+
+    const record = await fixture.record();
+    assert.deepEqual(record.argv.slice(-2), ["--resume", FIXTURE_SESSION_ID]);
+    assert.match(record.stdin, /second question/);
+    assert.doesNotMatch(record.stdin, /first question/);
+  });
+
+  it("resumes by anchor after the client truncates the history", async () => {
+    await fixture.use({
+      chunks: linesToChunks([initEvent(), resultMessage({ result: "answer two" })]),
+    });
+    await chat({
+      model,
+      messages: [
+        { role: "user", content: "question one" },
+        { role: "assistant", content: "answer one" },
+        { role: "user", content: "question two" },
+      ],
+    });
+
+    await fixture.use(RESUME_ECHO);
+    await chat({
+      model,
+      messages: [
+        { role: "user", content: "question two" },
+        { role: "assistant", content: "answer two" },
+        { role: "user", content: "question three" },
+      ],
+    });
+
+    const record = await fixture.record();
+    assert.deepEqual(record.argv.slice(-2), ["--resume", FIXTURE_SESSION_ID]);
+    assert.match(record.stdin, /question three/);
+    assert.doesNotMatch(record.stdin, /question two/);
+  });
+
+  it("starts fresh when the configuration changed under the session", async () => {
+    await fixture.use({
+      chunks: linesToChunks([initEvent(), resultMessage({ result: "kept" })]),
+    });
+    await chat({ model, messages: [{ role: "user", content: "remember" }] });
+
+    await startWith({ preset: "agent" });
+    await fixture.use(RESUME_ECHO);
+    await chat({
+      model,
+      messages: [
+        { role: "user", content: "remember" },
+        { role: "assistant", content: "kept" },
+        { role: "user", content: "and now?" },
+      ],
+    });
+
+    const record = await fixture.record();
+    assert.ok(!record.argv.includes("--resume"), "a different profile is a miss");
+    assert.match(record.stdin, /remember/, "so the full history is replayed");
+    await startWith();
+  });
+
+  it("honours a narrowed session strategy", async () => {
+    await startWith({ sessionStrategy: ["user"] });
+    await fixture.use({
+      chunks: linesToChunks([initEvent(), resultMessage({ result: "an answer" })]),
+    });
+    await chat({ model, messages: [{ role: "user", content: "a question" }] });
+
+    await fixture.use(RESUME_ECHO);
+    await chat({
+      model,
+      messages: [
+        { role: "user", content: "a question" },
+        { role: "assistant", content: "an answer" },
+        { role: "user", content: "another" },
+      ],
+    });
+
+    const record = await fixture.record();
+    assert.ok(!record.argv.includes("--resume"));
+    await startWith();
+  });
+
+  it("survives a proxy restart", async () => {
+    await fixture.use({
+      chunks: linesToChunks([initEvent(), resultMessage({ result: "persisted answer" })]),
+    });
+    await chat({ model, messages: [{ role: "user", content: "persisted question" }] });
+
+    // A restart with the same index file must find the session again.
+    resetSessionIndexes();
+    await startWith();
+
+    await fixture.use(RESUME_ECHO);
+    await chat({
+      model,
+      messages: [
+        { role: "user", content: "persisted question" },
+        { role: "assistant", content: "persisted answer" },
+        { role: "user", content: "after the restart" },
+      ],
+    });
+
+    const record = await fixture.record();
+    assert.deepEqual(record.argv.slice(-2), ["--resume", FIXTURE_SESSION_ID]);
+  });
+
+  it("gives a second concurrent request its own session", async () => {
+    await startWith({ sessionLockTimeoutMs: 50 });
+    await fixture.use({
+      chunks: linesToChunks([initEvent(), resultMessage({ result: "shared answer" })]),
+    });
+    await chat({ model, messages: [{ role: "user", content: "shared question" }] });
+
+    const follow = {
+      model,
+      messages: [
+        { role: "user", content: "shared question" },
+        { role: "assistant", content: "shared answer" },
+        { role: "user", content: "at the same time" },
+      ],
+    };
+
+    await fixture.use({
+      chunks: linesToChunks([initEvent(), resultMessage({ result: "ok" })], 120),
+    });
+    const [a, b] = await Promise.all([chat(follow), chat(follow)]);
+
+    assert.equal(a.status, 200);
+    assert.equal(b.status, 200);
     await startWith();
   });
 });
