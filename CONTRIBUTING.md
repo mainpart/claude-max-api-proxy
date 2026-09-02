@@ -26,7 +26,21 @@ Thank you for your interest in contributing!
 
 ## Testing
 
-Test your changes with:
+```bash
+npm test          # offline suite; spends nothing, safe to run in a loop
+npm run test:e2e  # drives the real CLI and SPENDS SUBSCRIPTION TOKENS
+```
+
+`npm test` runs everything against a generated stand-in for the CLI
+(`src/testing/fixture-cli.ts`), which replays recorded stream-json scenarios
+and records the argv and stdin it was given. Add a scenario there rather than
+reaching for the real binary.
+
+`src/e2e.test.ts` makes real requests on your subscription. It skips unless
+you ask for it by name or set `RUN_E2E=1`, and a pull request does not need it
+to have been run.
+
+Manual checks against a live server:
 
 ```bash
 # Start the server

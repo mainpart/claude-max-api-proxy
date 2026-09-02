@@ -39,20 +39,22 @@ Your App (OpenClaw, Continue.dev, etc.)
 - **OpenAI-compatible API** — Works with any client that supports OpenAI's API format
 - **Streaming support** — Real-time token streaming via Server-Sent Events
 - **Multiple models** — Claude Opus, Sonnet, and Haiku with flexible model aliases
-- **OpenClaw integration** — Automatic tool name mapping and system prompt adaptation
-- **Content block handling** — Proper text block separators for multi-block responses
-- **Session management** — Maintains conversation context via session IDs
+- **Economy mode** — Runs the CLI as a plain model: no CLAUDE.md, memory, skills, MCP servers or tools
+- **Prompt caching** — Resumes the CLI session so long conversations hit the cache
+- **`response_format`** — Both `json_schema` and `json_object`
+- **Configurable** — Config file, environment variables, or command line
 - **Auto-start service** — Optional LaunchAgent for macOS
-- **Zero configuration** — Uses existing Claude CLI authentication
 - **Secure by design** — Uses `spawn()` to prevent shell injection
 
 ## What's Different from the Original
 
-- **OpenClaw tool mapping** — Maps OpenClaw tool names (`exec`, `read`, `web_search`, etc.) to Claude Code equivalents (`Bash`, `Read`, `WebSearch`)
-- **System prompt stripping** — Removes OpenClaw-specific tooling sections that confuse the CLI
-- **Content block support** — Handles `input_text` content blocks and multi-block text separators
-- **Tool call types** — Full OpenAI tool call type definitions for streaming and non-streaming
-- **Improved streaming** — Better SSE handling with connection confirmation and client disconnect detection
+- **Economy preset (default here)** — 246 prompt tokens for a question that cost 24 603 with the CLI unrestricted, measured through the proxy on one machine
+- **Session lookup without `user`** — Conversations are identified from their own messages, so resume and prompt caching work with clients that never send that optional field
+- **Persisted session index** — A proxy restart no longer starts every conversation over
+- **`response_format` support** — `json_schema` maps to `--json-schema`; `json_object` is instructed in the system prompt
+- **Streaming repairs** — Correct model name, honest HTTP status on startup failures, `[DONE]` on every path, cache-aware `usage`, mapped `finish_reason`, rate-limit handling, thinking blocks modelled
+- **Configuration layer** — Port, host, working directory, timeout, preset, tools, extra CLI flags
+- **Offline test suite** — `npm test` drives a stand-in CLI and spends no tokens
 
 ## Prerequisites
 
@@ -93,6 +95,159 @@ The server runs at `http://localhost:3456` by default. Pass a custom port as an 
 node dist/server/standalone.js 8080
 ```
 
+## Configuration
+
+Settings resolve in this order, each layer overriding the one before it:
+
+1. built-in defaults
+2. `~/.claude-max-api-proxy/config.json` (or `--config <path>`, or `CLAUDE_PROXY_CONFIG`)
+3. `CLAUDE_PROXY_*` environment variables
+4. command-line arguments
+
+```json
+{
+  "port": 3456,
+  "host": "127.0.0.1",
+  "preset": "economy",
+  "cwd": "/Users/you/.claude-max-api-proxy/workspace",
+  "timeoutMs": 900000,
+  "streaming": { "thinking": "drop" }
+}
+```
+
+| Key | CLI flag | Environment | Default | Meaning |
+|---|---|---|---|---|
+| `port` | `--port`, first positional | `CLAUDE_PROXY_PORT` | `3456` | Listening port |
+| `host` | `--host` | `CLAUDE_PROXY_HOST` | `127.0.0.1` | Listening address |
+| `preset` | `--preset` | `CLAUDE_PROXY_PRESET` | `economy` | `economy` or `agent`, see below |
+| `cwd` | `--cwd` | `CLAUDE_PROXY_CWD` | `~/.claude-max-api-proxy/workspace` | Working directory of the CLI subprocess; `inherit` uses the proxy's own |
+| `tools` | `--tools` | `CLAUDE_PROXY_TOOLS` | preset decides | Value for the CLI's `--tools` |
+| `timeoutMs` | `--timeout-ms` | `CLAUDE_PROXY_TIMEOUT_MS` | `900000` | Per-request timeout |
+| `extraArgs` | `--extra-arg` (repeatable) | `CLAUDE_PROXY_EXTRA_ARGS` | `[]` | Extra CLI flags |
+| `binArgs` | `--bin-arg` (repeatable) | `CLAUDE_PROXY_BIN_ARGS` | `[]` | Arguments before every CLI flag, for wrapper binaries |
+| `sessionIndexPath` | `--session-index` | `CLAUDE_PROXY_SESSION_INDEX` | `~/.claude-max-api-proxy/sessions.json` | Where the session index is kept |
+| `sessionStrategy` | `--session-strategy` | `CLAUDE_PROXY_SESSION_STRATEGY` | `user,anchor,prefix,scan` | Which session lookups to try |
+| `sessionLockTimeoutMs` | `--session-lock-ms` | `CLAUDE_PROXY_SESSION_LOCK_MS` | `30000` | Wait for a busy session before starting a fresh one |
+| `streaming.thinking` | `--thinking` | `CLAUDE_PROXY_THINKING` | `drop` | `drop`, or `reasoning_content` to forward thinking text |
+| `streaming.headerFlushMs` | `--header-flush-ms` | `CLAUDE_PROXY_HEADER_FLUSH_MS` | `1000` | How long SSE headers are held back so failures can still be an HTTP status |
+| `streaming.resultGraceMs` | `--result-grace-ms` | `CLAUDE_PROXY_RESULT_GRACE_MS` | `2000` | Grace before the subprocess is killed, so it can finish its transcript |
+
+`CLAUDE_BIN`, `DEBUG` and `DEBUG_SUBPROCESS` continue to work as before.
+
+`extraArgs` is read from configuration only, never from a request body. Flags
+such as `--mcp-config`, `--settings` or `--add-dir` combined with tools enabled
+amount to running code on the machine holding your subscription, and an HTTP
+client has no business choosing them. Flags the proxy sets per request
+(`--print`, `--output-format`, `--resume`, `--session-id`, …) are rejected at
+startup with a message naming the flag.
+
+### Presets
+
+`economy` (the default here) runs the CLI as a plain model behind HTTP:
+
+```
+--safe-mode --tools "" --system-prompt "<what the client sent>"
+```
+
+`--safe-mode` drops your customisations — CLAUDE.md, automatic memory, skills,
+MCP servers. `--system-prompt` replaces the built-in Claude Code prompt with
+the client's own system messages; when the client sends none, the empty string
+removes the system block from the request entirely.
+
+The same one-word question on haiku, through this proxy, on one machine:
+
+| Preset | Prompt tokens |
+|---|---|
+| `agent` | 24 603 |
+| `economy` | 246 |
+
+The `agent` figure is whatever your own CLAUDE.md, memory, skills and MCP
+servers add up to, so it varies by machine. The `economy` figure does not.
+
+`agent` reproduces the behaviour this proxy had before presets existed:
+permissions skipped, the CLI's own tool set, and the OpenClaw tool-name map
+appended to the system prompt. Use it if you want the model to actually run
+tools on your machine.
+
+The working directory matters more than it looks. By default the CLI runs in
+`~/.claude-max-api-proxy/workspace`, an empty directory the proxy owns, so
+there is no CLAUDE.md or git status to pull in, the proxy's session
+transcripts stay out of your interactive ones, and a run with tools enabled
+cannot wander into whatever repository the proxy was started from. Set
+`"cwd": "inherit"` for the old behaviour.
+
+## Sessions and prompt caching
+
+Each conversation is continued in a persisted CLI session, so only the new
+turn is sent and the rest is served from the API-side prompt cache. The
+conversation is recognised from its own messages — a hash of the history, plus
+an anchor on the last exchange that survives a client truncating old turns —
+so this works whether or not the client sends the optional OpenAI `user`
+field. If the index is cold, the proxy reads the tail of the CLI's own
+transcripts for the working directory, limited to files touched within the
+last hour.
+
+`usage.prompt_tokens_details.cached_tokens` in the response is how you check
+that it is working. Three turns of one conversation, measured:
+
+```
+turn 1   cached_tokens 0
+turn 2   cached_tokens 5848
+turn 3   cached_tokens 6064
+```
+
+Zeros across every turn usually mean the client changes its system prompt
+between turns — the current time, a turn counter. The system block heads the
+cached prefix, so changing it re-caches the whole conversation. That is worth
+fixing in the client, not in the proxy.
+
+Two notes on the trade-offs behind this:
+
+- Sessions are persisted, so the CLI writes a transcript per conversation
+  under `~/.claude/projects/`. That file is exactly what makes resume work.
+- Prompt caching has a minimum cacheable prefix (about 2 048 tokens for
+  haiku). Short conversations show `cached_tokens: 0` simply because there is
+  not enough to cache.
+
+## JSON responses
+
+`response_format` is supported in both forms.
+
+```json
+{
+  "model": "claude-sonnet-4",
+  "messages": [{"role": "user", "content": "Capital of France and its population?"}],
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {"name": "city", "schema": {"type": "object", "properties": {"city": {"type": "string"}}}}
+  }
+}
+```
+
+The inner `schema` goes to the CLI's `--json-schema`. `name` and `strict` are
+accepted and ignored — the CLI takes a bare schema. It works with `stream:
+true` as well: the JSON is streamed as it is generated.
+
+`{"type": "json_object"}` has no CLI flag behind it, so the proxy instructs the
+model in the system prompt and strips a Markdown code fence from the answer if
+the model added one.
+
+One thing to know before you trust the output: a schema can be satisfied
+formally and still be empty. Asked something its schema does not cover, the
+model returns `""` in the required field — right type, right key, no content.
+The proxy cannot tell that from an answer, so validate values, not just
+structure.
+
+## Privacy
+
+In `economy` mode the request the CLI sends contains your client's system
+prompt and messages, and little else. One exception is worth knowing about:
+Claude Code attaches a `<system-reminder>` block to the **first** user message
+of a session containing the current date and, if the CLI is signed in with a
+subscription, the account's email address. Verified by intercepting the
+request body — it appears once per session, not on every turn, and
+`--safe-mode` does not remove it. There is no flag to switch it off.
+
 ### Test it
 
 ```bash
@@ -127,6 +282,11 @@ curl -N -X POST http://localhost:3456/v1/chat/completions \
 | `/health` | GET | Health check |
 | `/v1/models` | GET | List available models |
 | `/v1/chat/completions` | POST | Chat completions (streaming & non-streaming) |
+
+Supported request fields: `model`, `messages`, `stream`, `stream_options`,
+`response_format`, `user`. Sampling parameters (`temperature`, `top_p`,
+`max_tokens`, the penalties) are accepted and ignored — the CLI does not
+expose them.
 
 ## Available Models
 
@@ -207,14 +367,27 @@ src/
 │   ├── openai-to-cli.ts   # Convert OpenAI requests → CLI format
 │   └── cli-to-openai.ts   # Convert CLI responses → OpenAI format
 ├── subprocess/
-│   └── manager.ts         # Claude CLI subprocess + OpenClaw tool mapping
+│   ├── manager.ts         # Claude CLI subprocess, argument assembly
+│   ├── openclaw-prompt.ts # Tool-name map used only by the `agent` preset
+│   └── session-store.ts   # Persisted session index + per-session mutex
 ├── session/
-│   └── manager.ts         # Session ID mapping
+│   ├── key.ts             # Conversation keys: prefix hash and anchor
+│   └── transcript-scan.ts # Cold-index fallback: read the CLI's transcripts
 ├── server/
 │   ├── index.ts           # Express server setup
 │   ├── routes.ts          # API route handlers
 │   └── standalone.ts      # Entry point
+├── testing/
+│   └── fixture-cli.ts     # Stand-in CLI for the offline tests
+├── config.ts              # Configuration layer
 └── index.ts               # Package exports
+```
+
+## Tests
+
+```bash
+npm test          # offline, drives a stand-in CLI, spends nothing
+npm run test:e2e  # drives the real CLI and spends subscription tokens
 ```
 
 ## Security
@@ -233,6 +406,17 @@ Install and authenticate the CLI:
 npm install -g @anthropic-ai/claude-code
 claude auth login
 ```
+
+### `cached_tokens` is always 0
+
+Either the conversation is shorter than the cacheable minimum (about 2 048
+tokens on haiku), or the client sends a different system prompt on each turn.
+Compare two consecutive requests from your client and see whether their system
+messages are byte-identical.
+
+### Answers ignore my CLAUDE.md, skills or MCP servers
+
+That is `economy` doing its job. Set `"preset": "agent"` if you want them.
 
 ### Streaming returns immediately with no content
 
