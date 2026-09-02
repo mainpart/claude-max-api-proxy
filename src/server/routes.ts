@@ -25,6 +25,7 @@ import {
 } from "../adapter/cli-to-openai.js";
 import { getSessionIndex, type SessionIndex } from "../subprocess/session-store.js";
 import { lookupKeys, profileHash, storeKeys } from "../session/key.js";
+import { findSessionByAnchor } from "../session/transcript-scan.js";
 import type {
   OpenAIChatMessage,
   OpenAIChatRequest,
@@ -40,7 +41,7 @@ import type {
 } from "../types/claude-cli.js";
 import { isRateLimited } from "../types/claude-cli.js";
 import type { ProxyConfig } from "../config.js";
-import { DEFAULTS } from "../config.js";
+import { DEFAULTS, resolveCwd } from "../config.js";
 
 interface SessionContext {
   /** Session id handed to the CLI for this run. */
@@ -182,6 +183,31 @@ async function resolveCliInput(
         release,
       },
     };
+  }
+
+  // Nothing in the index: the CLI's own transcripts may still hold this
+  // conversation, from before a restart or from another proxy process.
+  if (keys.anchor && keys.anchorIndex !== undefined && strategies.has("scan")) {
+    const found = await findSessionByAnchor({ cwd: resolveCwd(config), anchor: keys.anchor });
+    if (found) {
+      const release = await index.acquire(found, config.sessionLockTimeoutMs);
+      if (release) {
+        const cliInput = openaiToCliDelta(body, keys.anchorIndex, config.preset);
+        cliInput.sessionId = found;
+        return {
+          cliInput,
+          session: {
+            sessionId: found,
+            resume: true,
+            userKey,
+            profile,
+            messages: body.messages,
+            index,
+            release,
+          },
+        };
+      }
+    }
   }
 
   const cliInput = openaiToCli(body, config.preset);

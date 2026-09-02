@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
@@ -149,15 +149,17 @@ describe("workspace", () => {
     assert.notEqual(config.cwd, "inherit");
   });
 
-  it("still allows the old behaviour explicitly", () => {
+  it("still allows the old behaviour explicitly", async () => {
     const config = resolveConfig({ argv: ["--cwd", "inherit"], env: {}, skipFile: true });
-    assert.equal(resolveCwd(config), process.cwd());
+    assert.equal(resolveCwd(config), await realpath(process.cwd()));
   });
 
   it("creates the working directory it hands to the CLI", async () => {
     const target = path.join(dir, "nested", "workspace");
     const config = resolveConfig({ argv: ["--cwd", target], env: {}, skipFile: true });
-    assert.equal(resolveCwd(config), target);
+    // Resolved through symlinks: the CLI names its transcript folder after
+    // the directory it actually runs in.
+    assert.equal(resolveCwd(config), await realpath(target));
     await stat(target);
   });
 });

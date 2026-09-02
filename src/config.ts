@@ -501,8 +501,21 @@ export function resolveConfig(options: ResolveOptions = {}): ProxyConfig {
  * proxy owns it. `"inherit"` keeps the proxy's own cwd.
  */
 export function resolveCwd(config: ProxyConfig): string {
-  if (config.cwd === "inherit") return process.cwd();
+  if (config.cwd === "inherit") return realpath(process.cwd());
   const dir = path.resolve(config.cwd);
   fs.mkdirSync(dir, { recursive: true });
-  return dir;
+  return realpath(dir);
+}
+
+/**
+ * Resolve symlinks. The CLI names its transcript folder after the directory
+ * it actually runs in, and on macOS /tmp is a link to /private/tmp — so a
+ * proxy that keeps the unresolved path looks in a folder that does not exist.
+ */
+function realpath(dir: string): string {
+  try {
+    return fs.realpathSync(dir);
+  } catch {
+    return dir;
+  }
 }

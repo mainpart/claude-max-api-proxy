@@ -34,6 +34,17 @@ function digest(parts: string[]): string {
   return createHash("sha256").update(parts.join("\n")).digest("hex").slice(0, 32);
 }
 
+/**
+ * Anchor digest for a (user, assistant) pair given as plain text — the form
+ * the transcript scan works with.
+ */
+export function anchorFromTexts(userText: string, assistantText: string): string {
+  return digest([
+    canonical({ role: "user", content: userText }),
+    canonical({ role: "assistant", content: assistantText }),
+  ]);
+}
+
 export interface LookupKeys {
   /** Absent on a first turn, where there is no prefix to hash. */
   prefix?: string;
