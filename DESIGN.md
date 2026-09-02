@@ -1,5 +1,12 @@
 # Claude Code CLI Provider - Technical Design
 
+> Historical document: this is the design the project was built from, and its
+> code samples are illustrative rather than current. For how the proxy behaves
+> today see README.md, and for what is known about the CLI's protocol see
+> PROTOCOL.md. Section 7 in particular describes a `session/manager.ts` that no
+> longer exists — sessions live in `subprocess/session-store.ts` and
+> `session/key.ts`.
+
 ## Overview
 
 This plugin enables Clawdbot to use Claude Max subscription through the Claude Code CLI, bypassing the OAuth token scope restrictions that block direct API access.
