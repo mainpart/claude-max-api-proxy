@@ -126,7 +126,6 @@ not per turn, and `--safe-mode` does not remove it. No flag switches it off.
 
 ## Running as a service
 
-[docs/macos-setup.md](docs/macos-setup.md) has the LaunchAgent plist and the `launchctl`
-commands. launchd does not inherit a shell `PATH`, so the plist needs an absolute path to
-`node` — an nvm upgrade moves it and the service stops starting — and `claude` has to be on
-the `PATH` the plist declares.
+Under a launchd LaunchAgent or systemd unit, remember that neither inherits a shell `PATH`:
+the unit needs an absolute path to `node` — an nvm upgrade moves it and the service stops
+starting — and `claude` has to be on the `PATH` the unit declares.

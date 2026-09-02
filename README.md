@@ -10,35 +10,32 @@
 client — the `openai` SDK, Continue.dev, litellm, your own script — at `http://localhost:3456/v1`
 and the answers come from the Pro, Max or Team plan you already pay for.
 
-## What it solves
-
-Anthropic does not accept subscription OAuth tokens on the public API, so anything that talks
-to Claude programmatically needs a second, metered API key. The Claude Code CLI does accept
-those tokens. This proxy runs the CLI as a subprocess and speaks OpenAI over HTTP in front of
-it, which puts the subscription within reach of tools that only know how to be OpenAI clients.
-
 ```
 your app ──HTTP(OpenAI)──▶ proxy ──spawn──▶ claude CLI ──OAuth──▶ Anthropic
 ```
 
 The limits are the CLI's own: its rate limits, its models, and no sampling parameters.
 
+## Is it safe?
+
+Your credentials never leave the CLI. Authentication stays in the keychain entry Claude Code
+already owns; the proxy holds no token, stores none, and sends none anywhere. It only starts
+`claude` in print mode — the documented way to use the CLI programmatically — and translates
+what comes back.
+
+What Anthropic refuses is a subscription OAuth token used directly by a third-party client.
+That is the risky pattern, and it is precisely the one this avoids: the token stays where it
+belongs and only the CLI ever presents it. Requests still count against your subscription's
+own limits.
+
 ## Install
 
-Node 20+ and the Claude Code CLI, signed in:
+Node 20+, plus the Claude Code CLI signed in (`npm install -g @anthropic-ai/claude-code &&
+claude auth login`).
 
 ```bash
-npm install -g @anthropic-ai/claude-code
-claude auth login
-```
-
-Then:
-
-```bash
-git clone https://github.com/mainpart/claude-max-api-proxy.git
-cd claude-max-api-proxy
-npm install
-npm run build
+git clone https://github.com/mainpart/claude-max-api-proxy.git && cd claude-max-api-proxy
+npm install && npm run build
 ```
 
 ## Run
@@ -99,37 +96,32 @@ Model ids follow the `claude-opus-4`, `claude-sonnet-4-5`, `claude-haiku-4-5` pa
 bare aliases `opus`, `sonnet` and `haiku` work too. Sampling parameters (`temperature`,
 `top_p`, `max_tokens`) are accepted and ignored, because the CLI does not expose them.
 
-## Two presets
+## What reaches the model
 
-`economy`, the default, runs the CLI as a plain model behind HTTP:
+A request arrives as an OpenAI `messages` array; the CLI takes a system prompt as a flag and
+one turn on stdin. The proxy bridges the two, and the difference between a cheap request and
+an expensive one is decided here.
 
-```
---safe-mode --tools "" --system-prompt "<what the client sent>"
-```
+**System messages become the system prompt.** They are passed as `--system-prompt`, which
+*replaces* Claude Code's own built-in prompt rather than adding to it. A client that sends no
+system message gets an empty one, and the system block disappears from the request entirely.
 
-Your customisations stay out — CLAUDE.md, automatic memory, skills, MCP servers — and the
-client's own system messages replace Claude Code's built-in prompt. Without this, every
-request would carry your whole agent setup as prompt tokens, which on a loaded machine is two
-orders of magnitude more than the question itself.
+**Your agent setup stays out.** Under the default `economy` preset the CLI runs with
+`--safe-mode --tools ""`: no CLAUDE.md, no automatic memory, no skills, no MCP servers, no
+tools. Without it, every request would carry your whole local setup as prompt tokens, which on
+a loaded machine dwarfs the question itself. Set `"preset": "agent"` to opt back in — the CLI's
+own tool set, permissions skipped — when you want the model to actually do things on your
+machine.
 
-`agent` is the opposite choice: permissions skipped, the CLI's own tool set, the OpenClaw
-tool-name map appended to the system prompt. Use it when you want the model to actually run
-tools on your machine.
-
-The working directory matters more than it looks. By default the CLI runs in
+**The working directory is a boundary.** By default the CLI runs in
 `~/.claude-max-api-proxy/workspace`, an empty directory the proxy owns, so no CLAUDE.md or git
-status gets pulled in, the proxy's transcripts stay out of your interactive sessions, and a
-run with tools enabled cannot wander into whatever repository the proxy was started from.
-`"cwd": "inherit"` puts the CLI back in the proxy's own directory.
+status gets pulled in from wherever the proxy was started, and its transcripts stay out of your
+interactive sessions. `"cwd": "inherit"` removes that separation.
 
-## Continuing a conversation
-
-OpenAI clients resend the whole history on every turn. Replaying it as a fresh prompt each
-time would miss the prompt cache entirely, so the proxy instead recognises the conversation
-and continues the CLI session that already holds it — only the new turn is sent, and the rest
-is served from the cache.
-
-Recognition is by lookup key, tried in this order:
+**Only the new turn is sent.** OpenAI clients resend the whole history every time. Replaying
+it as a fresh prompt would miss the prompt cache, so the proxy recognises the conversation and
+resumes the CLI session that already holds it; the history is then already in the session and
+only the latest turn goes down stdin. Recognition is by lookup key, tried in this order:
 
 | Strategy | Key | Good for |
 |---|---|---|
@@ -138,18 +130,15 @@ Recognition is by lookup key, tried in this order:
 | `prefix` | Hash of every message but the last | Exact match; misses if the client rewrites an earlier turn |
 | `scan` | The CLI's own transcripts on disk | A cold index after a restart; limited to files touched in the last hour |
 
-The first strategy that finds a live session wins; if none does, the conversation starts a
-fresh session with the full history, which is correct but uncached. Narrow the list with
+The first strategy that finds a live session wins. If none does, the conversation starts a
+fresh session with the full history — correct, just uncached. Narrow the list with
 `sessionStrategy` for a stricter proxy.
 
-`usage.prompt_tokens_details.cached_tokens` in the response tells you whether it worked. It
-stays at zero when the conversation is shorter than the cacheable minimum, or when the client
-changes its system prompt between turns — the system block heads the cached prefix, so
-editing it re-caches everything after it.
-
-The session index lives in `~/.claude-max-api-proxy/sessions.json` and entries expire after
-six hours of inactivity. The CLI writes a transcript per conversation under
-`~/.claude/projects/`; that file is what makes resume work, and the proxy does not delete it.
+The index of known conversations lives in `~/.claude-max-api-proxy/sessions.json`, and entries
+expire after six hours of inactivity. The sessions themselves are the CLI's own: it writes one
+`.jsonl` transcript per conversation under `~/.claude/projects/`, in a subdirectory named after
+the working directory. Those files are what `--resume` reads, and the proxy does not delete
+them.
 
 ## Configuration
 
@@ -197,7 +186,6 @@ code on the machine that holds your subscription, and an HTTP client has no busi
 them. Flags the proxy sets per request (`--print`, `--output-format`, `--resume`,
 `--session-id`, …) are rejected at startup with a message naming the flag.
 
-Running it as a background service on macOS: [docs/macos-setup.md](docs/macos-setup.md).
 Notes for working on the code: [CLAUDE.md](CLAUDE.md).
 
 ## License
