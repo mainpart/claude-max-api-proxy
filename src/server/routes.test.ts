@@ -190,6 +190,21 @@ describe("chat completions over a fixture CLI", () => {
     assert.equal(json.error.code, "invalid_messages");
   });
 
+  it("rejects a body larger than the configured limit", async () => {
+    // A 1kb limit keeps the test from pushing 11 MB through the loopback.
+    await startWith({ bodyLimit: "1kb" });
+    try {
+      const content = "x".repeat(2000);
+      const { status, json } = await postRaw(
+        JSON.stringify({ model: "claude-sonnet-4", messages: [{ role: "user", content }] })
+      );
+      assert.equal(status, 413);
+      assert.equal(json.error.type, "invalid_request_error");
+    } finally {
+      await startWith();
+    }
+  });
+
   it("answers a non-streaming request in OpenAI shape", async () => {
     const { status, json } = await chat({
       model: "claude-sonnet-4",

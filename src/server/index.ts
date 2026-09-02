@@ -37,7 +37,7 @@ function createApp(config: ProxyConfig): Express {
   const app = express();
 
   // Middleware: use raw body parser + manual JSON parse for better error diagnostics
-  app.use(express.raw({ type: "application/json", limit: "10mb" }));
+  app.use(express.raw({ type: "application/json", limit: config.bodyLimit }));
   app.use((req: Request, res: Response, next: NextFunction) => {
     if (req.body && Buffer.isBuffer(req.body) && req.body.length > 0) {
       const raw = req.body.toString("utf8");

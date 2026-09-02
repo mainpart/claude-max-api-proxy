@@ -71,6 +71,10 @@ export interface ProxyConfig {
   extraArgs: string[];
   /** Arguments placed before every CLI flag — for wrapper binaries and tests. */
   binArgs: string[];
+  /**
+   * Largest request body accepted, in the `bytes` format (`"10mb"`, `"512kb"`).
+   */
+  bodyLimit: string;
   /** Where the session index is persisted across proxy restarts. */
   sessionIndexPath: string;
   /** Which lookups to try, in order. Narrow it for a stricter proxy. */
@@ -110,6 +114,7 @@ export const DEFAULTS: ProxyConfig = {
   tools: null,
   extraArgs: [],
   binArgs: [],
+  bodyLimit: "10mb",
   sessionIndexPath: path.join(PROXY_HOME, "sessions.json"),
   sessionStrategy: [...SESSION_STRATEGIES],
   sessionLockTimeoutMs: 30_000,
@@ -273,6 +278,9 @@ function validateLayer(raw: Record<string, unknown>, source: string): ConfigLaye
         layer.binArgs = asStringArray(value, `${source}.binArgs`);
         assertSafeArgs(layer.binArgs, `${source}.binArgs`);
         break;
+      case "bodyLimit":
+        layer.bodyLimit = asString(value, `${source}.bodyLimit`);
+        break;
       case "sessionIndexPath":
         layer.sessionIndexPath = asString(value, `${source}.sessionIndexPath`);
         break;
@@ -345,6 +353,7 @@ const ENV_KEYS: Record<string, EnvTarget> = {
   CLAUDE_PROXY_TOOLS: "tools",
   CLAUDE_PROXY_EXTRA_ARGS: "extraArgs",
   CLAUDE_PROXY_BIN_ARGS: "binArgs",
+  CLAUDE_PROXY_BODY_LIMIT: "bodyLimit",
   CLAUDE_PROXY_SESSION_INDEX: "sessionIndexPath",
   CLAUDE_PROXY_SESSION_STRATEGY: "sessionStrategy",
   CLAUDE_PROXY_SESSION_LOCK_MS: "sessionLockTimeoutMs",
@@ -423,6 +432,7 @@ export function parseArgv(argv: string[]): ArgvResult {
       case "--timeout-ms": raw.timeoutMs = takeValue(); break;
       case "--preset": raw.preset = takeValue(); break;
       case "--tools": raw.tools = takeValue(); break;
+      case "--body-limit": raw.bodyLimit = takeValue(); break;
       case "--session-index": raw.sessionIndexPath = takeValue(); break;
       case "--session-strategy":
         raw.sessionStrategy = takeValue().split(",").map((v) => v.trim()).filter(Boolean);
