@@ -302,9 +302,8 @@ src/
 └── config.ts     # configuration layers
 ```
 
-[PROTOCOL.md](PROTOCOL.md) records the CLI's JSON streaming protocol.
-[CLAUDE.md](CLAUDE.md) is the working brief for the repository.
-[DESIGN.md](DESIGN.md) is kept as history, not as current documentation.
+[CLAUDE.md](CLAUDE.md) is the working brief: the layout, the seams a test uses, and what is
+known about the CLI's behaviour that the code cannot state on its own.
 
 The CLI is started with `spawn()` and an argument array, never through a shell, so prompt
 text cannot become a command. The proxy stores no credentials of its own; authentication
@@ -330,7 +329,9 @@ what it was asked to do.
 
 ## Contributing
 
-Pull requests are welcome, with tests. [CONTRIBUTING.md](CONTRIBUTING.md) has the setup.
+Pull requests are welcome, with tests. Add a scenario to `src/testing/fixture-cli.ts` rather
+than reaching for the real binary; `npm test` has to stay offline. [CLAUDE.md](CLAUDE.md) has
+the rest.
 
 ## License
 

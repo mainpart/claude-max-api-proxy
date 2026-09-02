@@ -33,12 +33,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/atalovesyou/claude-max-api-proxy"
+    "url": "https://github.com/mainpart/claude-max-api-proxy"
   },
   "bugs": {
-    "url": "https://github.com/atalovesyou/claude-max-api-proxy/issues"
+    "url": "https://github.com/mainpart/claude-max-api-proxy/issues"
   },
-  "homepage": "https://github.com/atalovesyou/claude-max-api-proxy#readme",
+  "homepage": "https://github.com/mainpart/claude-max-api-proxy#readme",
   "dependencies": {
     "express": "^4.21.2",
     "uuid": "^11.0.5"
@@ -63,7 +63,6 @@
   "files": [
     "dist",
     "docs",
-    "README.md",
-    "CONTRIBUTING.md"
+    "README.md"
   ]
 }

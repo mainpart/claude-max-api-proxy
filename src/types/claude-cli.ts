@@ -1,6 +1,6 @@
 /**
  * Types for Claude Code CLI JSON streaming output
- * Based on research from PROTOCOL.md
+ * Behaviour notes that these types cannot state live in CLAUDE.md
  */
 
 export interface ClaudeCliInit {
