@@ -550,22 +550,25 @@ describe("response_format", () => {
 
     const record = await fixture.record();
     assert.ok(!record.argv.includes("--json-schema"));
-    const appended = record.argv[record.argv.indexOf("--append-system-prompt") + 1];
-    assert.doesNotMatch(appended, /single JSON value/);
+    assert.equal(record.argv[record.argv.indexOf("--system-prompt") + 1], "");
   });
 
   it("carries the json_object rule in the system prompt, not the turn text", async () => {
     await fixture.use(FENCED_JSON);
     await chat({
       model: "claude-haiku-4-5",
-      messages: [{ role: "user", content: "capital of France?" }],
+      messages: [
+        { role: "system", content: "You are terse." },
+        { role: "user", content: "capital of France?" },
+      ],
       response_format: { type: "json_object" },
     });
 
     const record = await fixture.record();
     assert.ok(!record.argv.includes("--json-schema"));
-    const appended = record.argv[record.argv.indexOf("--append-system-prompt") + 1];
-    assert.match(appended, /single JSON value/);
+    const system = record.argv[record.argv.indexOf("--system-prompt") + 1];
+    assert.match(system, /You are terse\./);
+    assert.match(system, /single JSON value/);
     assert.doesNotMatch(record.stdin, /single JSON value/);
   });
 
@@ -618,5 +621,89 @@ describe("response_format", () => {
     assert.equal(json.choices[0].message.content, "Hello there");
     const record = await fixture.record();
     assert.ok(!record.argv.includes("--json-schema"));
+  });
+});
+
+describe("economy preset over HTTP", () => {
+  before(async () => {
+    fixture = await createFixtureCli();
+    sandbox = await mkdtemp(path.join(tmpdir(), "claude-proxy-economy-"));
+
+    previousConfig = process.env.CLAUDE_PROXY_CONFIG;
+    const emptyConfig = path.join(sandbox, "config.json");
+    await writeFile(emptyConfig, "{}", "utf8");
+    process.env.CLAUDE_PROXY_CONFIG = emptyConfig;
+
+    previousBin = process.env.CLAUDE_BIN;
+    process.env.CLAUDE_BIN = fixture.bin;
+
+    await startWith();
+  });
+
+  after(async () => {
+    await stopServer();
+    if (previousBin === undefined) delete process.env.CLAUDE_BIN;
+    else process.env.CLAUDE_BIN = previousBin;
+    if (previousConfig === undefined) delete process.env.CLAUDE_PROXY_CONFIG;
+    else process.env.CLAUDE_PROXY_CONFIG = previousConfig;
+    await fixture.cleanup();
+    await rm(sandbox, { recursive: true, force: true });
+  });
+
+  it("sends the client's system message as a flag, not as turn text", async () => {
+    await fixture.use(RESUME_ECHO);
+    await chat({
+      model: "claude-haiku-4-5",
+      messages: [
+        { role: "system", content: "You are a pirate." },
+        { role: "user", content: "hello" },
+      ],
+    });
+
+    const record = await fixture.record();
+    assert.equal(record.argv[record.argv.indexOf("--system-prompt") + 1], "You are a pirate.");
+    assert.doesNotMatch(record.stdin, /pirate/);
+    assert.doesNotMatch(record.stdin, /<system>/);
+    assert.match(record.stdin, /hello/);
+  });
+
+  it("repeats the system prompt on resume, where the CLI inherits nothing", async () => {
+    const system = { role: "system", content: "You are a pirate." };
+    const first = [system, { role: "user", content: "first question" }];
+
+    await fixture.use(RESUME_ECHO);
+    await chat({ model: "claude-haiku-4-5", messages: first, user: "economy-1" });
+
+    await fixture.use(RESUME_ECHO);
+    await chat({
+      model: "claude-haiku-4-5",
+      messages: [...first, { role: "assistant", content: "arr" }, { role: "user", content: "second question" }],
+      user: "economy-1",
+    });
+
+    const record = await fixture.record();
+    assert.ok(record.argv.includes("--resume"));
+    assert.equal(record.argv[record.argv.indexOf("--system-prompt") + 1], "You are a pirate.");
+    assert.ok(record.argv.includes("--safe-mode"));
+    assert.equal(record.argv[record.argv.indexOf("--tools") + 1], "");
+    assert.match(record.stdin, /second question/);
+    assert.doesNotMatch(record.stdin, /first question/);
+  });
+
+  it("agent keeps the system message inline in the prompt", async () => {
+    await startWith({ preset: "agent" });
+    await fixture.use(RESUME_ECHO);
+    await chat({
+      model: "claude-haiku-4-5",
+      messages: [
+        { role: "system", content: "You are a pirate." },
+        { role: "user", content: "hello" },
+      ],
+    });
+
+    const record = await fixture.record();
+    assert.ok(!record.argv.includes("--system-prompt"));
+    assert.match(record.stdin, /<system>\s*You are a pirate\./);
+    await startWith();
   });
 });

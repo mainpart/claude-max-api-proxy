@@ -3,10 +3,12 @@
  */
 
 import type {
+  OpenAIChatMessage,
   OpenAIChatRequest,
   OpenAIContentBlock,
   OpenAIResponseFormat,
 } from "../types/openai.js";
+import type { Preset } from "../config.js";
 
 /** A request the proxy refuses before spawning anything. */
 export class InvalidRequestError extends Error {}
@@ -17,6 +19,12 @@ export interface CliInput {
   prompt: string;
   model: ClaudeModel;
   sessionId?: string;
+  /**
+   * The client's system messages, for presets that pass them as a flag. Sent
+   * on every turn including a resume, because the CLI rebuilds the system
+   * block from its arguments each time and stores none of it in the session.
+   */
+  system?: string;
 }
 
 /**
@@ -170,6 +178,32 @@ function stripOpenClawTooling(text: string): string {
 }
 
 /**
+ * Separate the client's system messages from the rest of the conversation.
+ *
+ * The system text then goes to `--system-prompt`, where the API keeps it in
+ * the cached prefix, rather than into the turn text, where it would be
+ * repeated into the history on every turn.
+ */
+export function splitSystem(messages: OpenAIChatMessage[]): {
+  system: string;
+  rest: OpenAIChatMessage[];
+} {
+  const system: string[] = [];
+  const rest: OpenAIChatMessage[] = [];
+
+  for (const msg of messages) {
+    if (msg.role === "system") {
+      const text = stripOpenClawTooling(extractText(msg.content));
+      if (text) system.push(text);
+    } else {
+      rest.push(msg);
+    }
+  }
+
+  return { system: system.join("\n\n"), rest };
+}
+
+/**
  * Convert OpenAI messages array to a single prompt string for Claude CLI
  *
  * Claude Code CLI in --print mode expects a single prompt, not a conversation.
@@ -205,9 +239,25 @@ export function messagesToPrompt(
 }
 
 /**
- * Convert OpenAI chat request to CLI input format
+ * Convert OpenAI chat request to CLI input format.
+ *
+ * Under `economy` the system messages are lifted out and returned separately;
+ * under `agent` they stay inline in the prompt, as they always did.
  */
-export function openaiToCli(request: OpenAIChatRequest): CliInput {
+export function openaiToCli(
+  request: OpenAIChatRequest,
+  preset: Preset = "agent"
+): CliInput {
+  if (preset === "economy") {
+    const { system, rest } = splitSystem(request.messages);
+    return {
+      prompt: messagesToPrompt(rest),
+      model: extractModel(request.model),
+      sessionId: request.user,
+      system,
+    };
+  }
+
   return {
     prompt: messagesToPrompt(request.messages),
     model: extractModel(request.model),
@@ -223,16 +273,33 @@ export function openaiToCli(request: OpenAIChatRequest): CliInput {
  */
 export function openaiToCliDelta(
   request: OpenAIChatRequest,
-  sinceIndex: number
+  sinceIndex: number,
+  preset: Preset = "agent"
 ): CliInput {
   const newMessages = request.messages
     .slice(sinceIndex)
     .filter((m) => m.role !== "assistant");
 
+  // Fallback to full history if nothing new was found (shouldn't happen,
+  // but never send an empty prompt to the CLI)
+  const tail = newMessages.length ? newMessages : request.messages;
+
+  if (preset === "economy") {
+    // System text is taken from the whole request, not from the tail: the
+    // client usually sends it as message 0, and the CLI needs it again on
+    // every resume.
+    const { system } = splitSystem(request.messages);
+    const { rest } = splitSystem(tail);
+    return {
+      prompt: messagesToPrompt(rest),
+      model: extractModel(request.model),
+      sessionId: request.user,
+      system,
+    };
+  }
+
   return {
-    // Fallback to full history if nothing new was found (shouldn't happen,
-    // but never send an empty prompt to the CLI)
-    prompt: messagesToPrompt(newMessages.length ? newMessages : request.messages),
+    prompt: messagesToPrompt(tail),
     model: extractModel(request.model),
     sessionId: request.user,
   };

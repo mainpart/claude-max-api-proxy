@@ -38,10 +38,10 @@ describe("buildArgs", () => {
     assert.deepEqual(args.slice(-2), ["--resume", "abc"]);
   });
 
-  it("omits --tools unless configured", () => {
-    assert.ok(!buildArgs(config(), { model: "sonnet" }).includes("--tools"));
+  it("omits --tools unless the preset or configuration asks for it", () => {
+    assert.ok(!buildArgs(config({ preset: "agent" }), { model: "sonnet" }).includes("--tools"));
 
-    const args = buildArgs(config({ tools: "" }), { model: "sonnet" });
+    const args = buildArgs(config({ preset: "agent", tools: "" }), { model: "sonnet" });
     assert.equal(args[args.indexOf("--tools") + 1], "");
   });
 
@@ -64,14 +64,74 @@ describe("buildArgs", () => {
     assert.deepEqual(first.slice(0, -2), resumed.slice(0, -2));
   });
 
-  it("defaults reproduce the pre-config behaviour", () => {
-    const args = buildArgs(resolveConfig({ argv: [], env: {}, skipFile: true }), {
-      model: "opus",
-    });
+  it("reproduces the pre-preset behaviour under `agent`", () => {
+    const args = buildArgs(config({ preset: "agent" }), { model: "opus" });
 
     assert.ok(args.includes("--dangerously-skip-permissions"));
-    assert.ok(args.includes("--append-system-prompt"));
+    assert.match(args[args.indexOf("--append-system-prompt") + 1], /Tool Name Mapping/);
     assert.ok(!args.includes("--tools"));
     assert.ok(!args.includes("--safe-mode"));
+    assert.ok(!args.includes("--system-prompt"));
+  });
+});
+
+describe("presets", () => {
+  it("economy strips the CLI down to a plain model", () => {
+    const args = buildArgs(config({ preset: "economy" }), {
+      model: "sonnet",
+      systemPrompt: "You are terse.",
+    });
+
+    assert.ok(args.includes("--safe-mode"));
+    assert.equal(args[args.indexOf("--system-prompt") + 1], "You are terse.");
+    assert.equal(args[args.indexOf("--tools") + 1], "");
+    assert.ok(!args.includes("--append-system-prompt"), "no OpenClaw tool map");
+    assert.ok(!args.includes("--dangerously-skip-permissions"), "nothing to permit");
+  });
+
+  it("economy sends an empty system prompt when the client sent none", () => {
+    const args = buildArgs(config({ preset: "economy" }), { model: "sonnet" });
+    const index = args.indexOf("--system-prompt");
+    assert.ok(index >= 0, "the flag is always present");
+    assert.equal(args[index + 1], "");
+  });
+
+  it("keeps --tools next to a flag, because it is variadic", () => {
+    const args = buildArgs(
+      config({ preset: "economy", extraArgs: ["--add-dir", "/tmp"] }),
+      { model: "sonnet", sessionId: "s1" }
+    );
+
+    const after = args[args.indexOf("--tools") + 2];
+    assert.ok(after.startsWith("-"), `expected a flag after --tools "", got ${after}`);
+  });
+
+  it("lets configuration override the preset's tool set", () => {
+    const args = buildArgs(config({ preset: "economy", tools: "Read,Bash" }), {
+      model: "sonnet",
+    });
+    assert.equal(args[args.indexOf("--tools") + 1], "Read,Bash");
+  });
+
+  it("appends the json_object rule to whichever system prompt the preset uses", () => {
+    const economy = buildArgs(config({ preset: "economy" }), {
+      model: "sonnet",
+      systemPrompt: "You are terse.",
+      systemSuffix: "Reply with JSON.",
+    });
+    assert.equal(
+      economy[economy.indexOf("--system-prompt") + 1],
+      "You are terse.\n\nReply with JSON."
+    );
+
+    const agent = buildArgs(config({ preset: "agent" }), {
+      model: "sonnet",
+      systemSuffix: "Reply with JSON.",
+    });
+    assert.match(agent[agent.indexOf("--append-system-prompt") + 1], /Reply with JSON\.$/);
+  });
+
+  it("ships economy as the fork default", () => {
+    assert.equal(resolveConfig({ argv: [], env: {}, skipFile: true }).preset, "economy");
   });
 });

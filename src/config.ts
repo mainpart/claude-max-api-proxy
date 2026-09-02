@@ -85,7 +85,10 @@ export const DEFAULTS: ProxyConfig = {
   host: "127.0.0.1",
   cwd: DEFAULT_WORKSPACE,
   timeoutMs: 900_000,
-  preset: "agent",
+  // Fork default. Upstream keeps "agent", where economy is opt-in and nothing
+  // changes for existing users; here the point of the fork is the cheap path,
+  // so it is the default. Deliberately a one-line divergence.
+  preset: "economy",
   tools: null,
   extraArgs: [],
   binArgs: [],

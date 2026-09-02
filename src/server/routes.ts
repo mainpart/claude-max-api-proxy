@@ -87,7 +87,10 @@ function contentFromResult(
  * when we have one for this `request.user` key instead of replaying the
  * full message history on every turn.
  */
-function resolveCliInput(body: OpenAIChatRequest): {
+function resolveCliInput(
+  body: OpenAIChatRequest,
+  preset: ProxyConfig["preset"]
+): {
   cliInput: ReturnType<typeof openaiToCli>;
   sessionKey: string | undefined;
   resume: boolean;
@@ -100,12 +103,12 @@ function resolveCliInput(body: OpenAIChatRequest): {
   const existing = sessionKey ? getSession(sessionKey) : undefined;
 
   if (existing) {
-    const cliInput = openaiToCliDelta(body, existing.messageCount);
+    const cliInput = openaiToCliDelta(body, existing.messageCount, preset);
     cliInput.sessionId = existing.claudeSessionId;
     return { cliInput, sessionKey, resume: true };
   }
 
-  const cliInput = openaiToCli(body);
+  const cliInput = openaiToCli(body, preset);
   if (sessionKey) {
     cliInput.sessionId = uuidv4(); // pin a known ID so we can --resume it later
   }
@@ -155,7 +158,7 @@ export async function handleChatCompletions(
     }
 
     // Convert to CLI input format, resuming a persisted session when we have one
-    const { cliInput, sessionKey, resume } = resolveCliInput(body);
+    const { cliInput, sessionKey, resume } = resolveCliInput(body, config.preset);
     const subprocess = new ClaudeSubprocess(config);
     const sessionCtx: SessionContext = { sessionKey, resume, messageCount: body.messages.length };
 
@@ -521,6 +524,7 @@ async function handleStreamingResponse(
         resume: sessionCtx.resume,
         jsonSchema: jsonMode.schema,
         systemSuffix: jsonMode.systemSuffix,
+        systemPrompt: cliInput.system,
       })
       .catch((err: Error) => {
         console.error("[Streaming] Subprocess start error:", err.message);
@@ -638,6 +642,7 @@ async function handleNonStreamingResponse(
         resume: sessionCtx.resume,
         jsonSchema: jsonMode.schema,
         systemSuffix: jsonMode.systemSuffix,
+        systemPrompt: cliInput.system,
       })
       .catch((error: Error) => {
         respond(() => {
