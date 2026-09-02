@@ -14,6 +14,8 @@ import {
 } from "../adapter/cli-to-openai.js";
 import { getSession, setSession, clearSession } from "../subprocess/session-store.js";
 import type { OpenAIChatRequest, OpenAIToolCall } from "../types/openai.js";
+import type { ProxyConfig } from "../config.js";
+import { DEFAULTS } from "../config.js";
 import type { ClaudeCliAssistant, ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
 
 interface SessionContext {
@@ -59,7 +61,8 @@ function resolveCliInput(body: OpenAIChatRequest): {
  */
 export async function handleChatCompletions(
   req: Request,
-  res: Response
+  res: Response,
+  config: ProxyConfig = DEFAULTS
 ): Promise<void> {
   const requestId = uuidv4().replace(/-/g, "").slice(0, 24);
   const body = req.body as OpenAIChatRequest;
@@ -80,7 +83,7 @@ export async function handleChatCompletions(
 
     // Convert to CLI input format, resuming a persisted session when we have one
     const { cliInput, sessionKey, resume } = resolveCliInput(body);
-    const subprocess = new ClaudeSubprocess();
+    const subprocess = new ClaudeSubprocess(config);
     const sessionCtx: SessionContext = { sessionKey, resume, messageCount: body.messages.length };
 
     if (stream) {

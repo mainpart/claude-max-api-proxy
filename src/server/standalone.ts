@@ -5,24 +5,28 @@
  * Usage:
  *   npm run start
  *   # or
- *   node dist/server/standalone.js [port]
+ *   node dist/server/standalone.js [port] [--option value ...]
+ *
+ * Settings come from ~/.claude-max-api-proxy/config.json, CLAUDE_PROXY_*
+ * environment variables, and the command line, in that order of precedence.
  */
 
 import { startServer, stopServer } from "./index.js";
 import { verifyClaude, verifyAuth } from "../subprocess/manager.js";
-
-const DEFAULT_PORT = 3456;
+import { ConfigError, resolveConfig } from "../config.js";
 
 async function main(): Promise<void> {
   console.log("Claude Code CLI Provider - Standalone Server");
   console.log("============================================\n");
 
-  // Parse port from command line
-  const port = parseInt(process.argv[2] || String(DEFAULT_PORT), 10);
-  if (isNaN(port) || port < 1 || port > 65535) {
-    console.error(`Invalid port: ${process.argv[2]}`);
+  let config;
+  try {
+    config = resolveConfig({ argv: process.argv.slice(2) });
+  } catch (err) {
+    console.error(err instanceof ConfigError ? err.message : err);
     process.exit(1);
   }
+  const { port } = config;
 
   // Verify Claude CLI
   console.log("Checking Claude CLI...");
@@ -32,6 +36,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
   console.log(`  Claude CLI: ${cliCheck.version || "OK"}`);
+  console.log(`  Preset: ${config.preset}  cwd: ${config.cwd}`);
 
   // Verify authentication
   console.log("Checking authentication...");
@@ -45,7 +50,7 @@ async function main(): Promise<void> {
 
   // Start server
   try {
-    await startServer({ port });
+    await startServer(config);
     console.log("\nServer ready. Test with:");
     console.log(`  curl -X POST http://localhost:${port}/v1/chat/completions \\`);
     console.log(`    -H "Content-Type: application/json" \\`);

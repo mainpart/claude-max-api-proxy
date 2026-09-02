@@ -7,18 +7,21 @@
 import express, { Express, Request, Response, NextFunction } from "express";
 import { createServer, Server } from "http";
 import { handleChatCompletions, handleModels, handleHealth } from "./routes.js";
+import type { ConfigLayer, ProxyConfig } from "../config.js";
+import { resolveConfig } from "../config.js";
 
-export interface ServerConfig {
-  port: number;
-  host?: string;
-}
+/**
+ * Overrides accepted by {@link startServer}. Anything omitted falls back to
+ * the config file, the environment, and finally the built-in defaults.
+ */
+export type ServerConfig = ConfigLayer;
 
 let serverInstance: Server | null = null;
 
 /**
  * Create and configure the Express app
  */
-function createApp(): Express {
+function createApp(config: ProxyConfig): Express {
   const app = express();
 
   // Middleware: use raw body parser + manual JSON parse for better error diagnostics
@@ -73,7 +76,9 @@ function createApp(): Express {
   // Routes
   app.get("/health", handleHealth);
   app.get("/v1/models", handleModels);
-  app.post("/v1/chat/completions", handleChatCompletions);
+  app.post("/v1/chat/completions", (req: Request, res: Response) =>
+    handleChatCompletions(req, res, config)
+  );
 
   // 404 handler
   app.use((_req: Request, res: Response) => {
@@ -104,15 +109,16 @@ function createApp(): Express {
 /**
  * Start the HTTP server
  */
-export async function startServer(config: ServerConfig): Promise<Server> {
-  const { port, host = "127.0.0.1" } = config;
-
+export async function startServer(overrides: ServerConfig = {}): Promise<Server> {
   if (serverInstance) {
     console.log("[Server] Already running, returning existing instance");
     return serverInstance;
   }
 
-  const app = createApp();
+  const config = resolveConfig({ overrides });
+  const { port, host } = config;
+
+  const app = createApp(config);
 
   return new Promise((resolve, reject) => {
     serverInstance = createServer(app);

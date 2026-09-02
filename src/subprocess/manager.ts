@@ -26,13 +26,17 @@ import {
   isContentBlockStop,
 } from "../types/claude-cli.js";
 import type { ClaudeModel } from "../adapter/openai-to-cli.js";
+import type { ProxyConfig } from "../config.js";
+import { DEFAULTS, resolveCwd } from "../config.js";
 
 export interface SubprocessOptions {
   model: ClaudeModel;
   sessionId?: string;
   /** Resume an existing persisted session (sessionId) instead of creating a new one */
   resume?: boolean;
+  /** Overrides `config.cwd` for this run. */
   cwd?: string;
+  /** Overrides `config.timeoutMs` for this run. */
   timeout?: number;
 }
 
@@ -196,13 +200,20 @@ export class ClaudeSubprocess extends EventEmitter {
   private buffer: string = "";
   private timeoutId: NodeJS.Timeout | null = null;
   private isKilled: boolean = false;
+  private readonly config: ProxyConfig;
+
+  constructor(config: ProxyConfig = DEFAULTS) {
+    super();
+    this.config = config;
+  }
 
   /**
    * Start the Claude CLI subprocess with the given prompt
    */
   async start(prompt: string, options: SubprocessOptions): Promise<void> {
     const args = this.buildArgs(options);
-    const timeout = options.timeout || DEFAULT_TIMEOUT;
+    const timeout = options.timeout ?? this.config.timeoutMs ?? DEFAULT_TIMEOUT;
+    const cwd = options.cwd ?? resolveCwd(this.config);
     if (process.env.DEBUG_SUBPROCESS) {
       console.error(`[Subprocess] args: ${JSON.stringify(args)}`);
       console.error(`[Subprocess] prompt: ${prompt.slice(0, 200)}`);
@@ -213,7 +224,7 @@ export class ClaudeSubprocess extends EventEmitter {
         // Use spawn() for security - no shell interpretation
         const { bin, shell } = resolveClaudeBin();
         this.process = spawn(bin, args, {
-          cwd: options.cwd || process.cwd(),
+          cwd,
           env: Object.fromEntries(
             Object.entries(process.env).filter(([k]) => k !== "CLAUDECODE")
           ),
@@ -290,22 +301,35 @@ export class ClaudeSubprocess extends EventEmitter {
   }
 
   /**
-   * Build CLI arguments array
+   * Build CLI arguments array.
+   *
+   * Order matters: wrapper arguments first, then the flags the proxy needs to
+   * speak its protocol, then the preset and configured flags, then the user's
+   * own `extraArgs`, and finally session selection. Session flags go last so
+   * that `extraArgs` cannot displace them, and the whole set is rebuilt from
+   * configuration on every run — including `--resume`, where the CLI inherits
+   * nothing from the session being resumed.
    */
   private buildArgs(options: SubprocessOptions): string[] {
     const args = [
+      ...this.config.binArgs,
       "--print", // Non-interactive mode
-      "--dangerously-skip-permissions", // Skip permission prompts
       "--output-format",
       "stream-json", // JSON streaming output
       "--verbose", // Required for stream-json
       "--include-partial-messages", // Enable streaming chunks
       "--model",
       options.model, // Model alias (opus/sonnet/haiku)
-      "--append-system-prompt",
-      OPENCLAW_TOOL_MAPPING_PROMPT,
       // Prompt is passed via stdin (avoids E2BIG on large inputs)
     ];
+
+    args.push(...this.presetArgs());
+
+    if (this.config.tools !== null) {
+      args.push("--tools", this.config.tools);
+    }
+
+    args.push(...this.config.extraArgs);
 
     if (options.sessionId && options.resume) {
       // Continue a previously persisted session — avoids replaying full history
@@ -321,6 +345,15 @@ export class ClaudeSubprocess extends EventEmitter {
     }
 
     return args;
+  }
+
+  /** Flags contributed by the active preset. */
+  private presetArgs(): string[] {
+    return [
+      "--dangerously-skip-permissions", // Skip permission prompts
+      "--append-system-prompt",
+      OPENCLAW_TOOL_MAPPING_PROMPT,
+    ];
   }
 
   /**
