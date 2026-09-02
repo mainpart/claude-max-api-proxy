@@ -19,6 +19,18 @@ export type ServerConfig = ConfigLayer;
 let serverInstance: Server | null = null;
 
 /**
+ * Status an error asks for. `body-parser` tags its own errors with the status
+ * the client deserves (413 for an oversized body, 400 for an aborted request);
+ * everything else is a proxy failure and stays a 500.
+ */
+function statusOf(err: Error): number {
+  const status = (err as { status?: unknown; statusCode?: unknown }).status
+    ?? (err as { statusCode?: unknown }).statusCode;
+  if (typeof status === "number" && status >= 400 && status < 500) return status;
+  return 500;
+}
+
+/**
  * Create and configure the Express app
  */
 function createApp(config: ProxyConfig): Express {
@@ -26,7 +38,7 @@ function createApp(config: ProxyConfig): Express {
 
   // Middleware: use raw body parser + manual JSON parse for better error diagnostics
   app.use(express.raw({ type: "application/json", limit: "10mb" }));
-  app.use((req: Request, _res: Response, next: NextFunction) => {
+  app.use((req: Request, res: Response, next: NextFunction) => {
     if (req.body && Buffer.isBuffer(req.body) && req.body.length > 0) {
       const raw = req.body.toString("utf8");
       if (process.env.DEBUG) {
@@ -46,7 +58,14 @@ function createApp(config: ProxyConfig): Express {
             url: req.originalUrl,
           });
         }
-        return next(err);
+        res.status(400).json({
+          error: {
+            message: `Invalid JSON in request body: ${msg}`,
+            type: "invalid_request_error",
+            code: "invalid_json",
+          },
+        });
+        return;
       }
     }
     next();
@@ -91,13 +110,16 @@ function createApp(config: ProxyConfig): Express {
     });
   });
 
-  // Error handler
+  // Error handler. Errors that reach it carry their own status when the client
+  // is at fault: body-parser throws 413 for an oversized body and 400 for an
+  // aborted request. Anything without a 4xx status is ours, and stays a 500.
   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
     console.error("[Server Error]:", err.message);
-    res.status(500).json({
+    const status = statusOf(err);
+    res.status(status).json({
       error: {
         message: err.message,
-        type: "server_error",
+        type: status >= 500 ? "server_error" : "invalid_request_error",
         code: null,
       },
     });

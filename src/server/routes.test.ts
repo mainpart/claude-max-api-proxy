@@ -66,6 +66,20 @@ async function chat(body: unknown): Promise<{ status: number; json: any }> {
   return { status: res.status, json: text ? JSON.parse(text) : null };
 }
 
+/** Bypasses JSON.stringify so the test can send a body the parser will reject. */
+async function postRaw(
+  body: string,
+  contentType = "application/json"
+): Promise<{ status: number; json: any }> {
+  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": contentType },
+    body,
+  });
+  const text = await res.text();
+  return { status: res.status, json: text ? JSON.parse(text) : null };
+}
+
 interface StreamResult {
   status: number;
   /** Payloads of `data:` lines, `[DONE]` excluded. */
@@ -152,6 +166,26 @@ describe("chat completions over a fixture CLI", () => {
 
   it("rejects a request without messages", async () => {
     const { status, json } = await chat({ model: "claude-sonnet-4", messages: [] });
+    assert.equal(status, 400);
+    assert.equal(json.error.code, "invalid_messages");
+  });
+
+  it("rejects a truncated JSON body as a client error", async () => {
+    const { status, json } = await postRaw('{"model":"sonnet","messages":[{"role":"user",');
+    assert.equal(status, 400);
+    assert.equal(json.error.type, "invalid_request_error");
+    assert.equal(json.error.code, "invalid_json");
+    assert.match(json.error.message, /position/);
+  });
+
+  it("rejects a JSON body that parses but is not a request object", async () => {
+    const { status, json } = await postRaw("[]");
+    assert.equal(status, 400);
+    assert.equal(json.error.code, "invalid_messages");
+  });
+
+  it("rejects an empty body", async () => {
+    const { status, json } = await postRaw("");
     assert.equal(status, 400);
     assert.equal(json.error.code, "invalid_messages");
   });
