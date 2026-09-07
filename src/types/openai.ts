@@ -1,7 +1,4 @@
-/**
- * Types for OpenAI-compatible API
- * Used for Clawdbot integration
- */
+/** Request and response types of the OpenAI chat completions API. */
 
 export interface OpenAIContentBlock {
   type: "text" | "input_text";

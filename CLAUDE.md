@@ -31,8 +31,8 @@ exported functions, and a comment earns its place by saying why rather than what
 | `src/types/openai.ts` | OpenAI request and response types |
 | `src/adapter/openai-to-cli.ts` | OpenAI request → CLI input, model map, delta assembly |
 | `src/adapter/cli-to-openai.ts` | CLI output → OpenAI response, usage, `finish_reason` |
+| `src/adapter/tool-emulation.ts` | `tools` → wrapper schema and prompt, wrapper → `tool_calls` |
 | `src/subprocess/manager.ts` | Spawning the CLI, `buildArgs`, stream parsing |
-| `src/subprocess/openclaw-prompt.ts` | Tool-name map, used by the `agent` preset only |
 | `src/subprocess/session-store.ts` | Persisted session index and per-session mutex |
 | `src/session/key.ts` | Conversation keys: prefix hash and anchor pair |
 | `src/session/transcript-scan.ts` | Cold-index fallback that reads CLI transcripts |
