@@ -64,14 +64,25 @@ describe("buildArgs", () => {
     assert.deepEqual(first.slice(0, -2), resumed.slice(0, -2));
   });
 
-  it("reproduces the pre-preset behaviour under `agent`", () => {
+  it("under `agent` skips permissions and appends nothing of its own", () => {
     const args = buildArgs(config({ preset: "agent" }), { model: "opus" });
 
     assert.ok(args.includes("--dangerously-skip-permissions"));
-    assert.match(args[args.indexOf("--append-system-prompt") + 1], /Tool Name Mapping/);
+    // An OpenClaw tool-name map used to be mixed in here. The caller's prompt
+    // now reaches the CLI as it was written, and the proxy adds nothing of its own.
+    assert.ok(!args.includes("--append-system-prompt"), "no prompt of our own");
     assert.ok(!args.includes("--tools"));
     assert.ok(!args.includes("--safe-mode"));
     assert.ok(!args.includes("--system-prompt"));
+  });
+
+  it("under `agent` appends the caller's system suffix, and only it", () => {
+    const args = buildArgs(config({ preset: "agent" }), {
+      model: "opus",
+      systemSuffix: "Be terse.",
+    });
+
+    assert.equal(args[args.indexOf("--append-system-prompt") + 1], "Be terse.");
   });
 });
 

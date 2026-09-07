@@ -32,7 +32,6 @@ import {
   isThinkingDelta,
 } from "../types/claude-cli.js";
 import type { ClaudeModel } from "../adapter/openai-to-cli.js";
-import { OPENCLAW_TOOL_MAPPING_PROMPT } from "./openclaw-prompt.js";
 import type { ProxyConfig } from "../config.js";
 import { DEFAULTS, resolveCwd } from "../config.js";
 
@@ -355,14 +354,14 @@ export class ClaudeSubprocess extends EventEmitter {
       return ["--safe-mode", "--system-prompt", system];
     }
 
-    const appended = [OPENCLAW_TOOL_MAPPING_PROMPT, options.systemSuffix]
-      .filter(Boolean)
-      .join("\n\n");
+    if (!options.systemSuffix) {
+      return ["--dangerously-skip-permissions"]; // Skip permission prompts
+    }
 
     return [
       "--dangerously-skip-permissions", // Skip permission prompts
       "--append-system-prompt",
-      appended,
+      options.systemSuffix,
     ];
   }
 
