@@ -28,6 +28,9 @@ import {
   SCHEMA_STREAM,
   SPLIT_JSON_LINE,
   THINKING_THEN_TEXT,
+  blockStop,
+  inputJsonDelta,
+  toolUseBlockStart,
   type FixtureCli,
   type FixtureSpec,
 } from "../testing/fixture-cli.js";
@@ -940,5 +943,186 @@ describe("session lookup without `user`", () => {
     assert.equal(a.status, 200);
     assert.equal(b.status, 200);
     await startWith();
+  });
+});
+
+describe("tool calling", () => {
+  before(async () => {
+    fixture = await createFixtureCli();
+    sandbox = await mkdtemp(path.join(tmpdir(), "claude-proxy-tools-"));
+
+    previousConfig = process.env.CLAUDE_PROXY_CONFIG;
+    const emptyConfig = path.join(sandbox, "config.json");
+    await writeFile(emptyConfig, "{}", "utf8");
+    process.env.CLAUDE_PROXY_CONFIG = emptyConfig;
+
+    previousBin = process.env.CLAUDE_BIN;
+    process.env.CLAUDE_BIN = fixture.bin;
+
+    await startWith();
+  });
+
+  after(async () => {
+    await stopServer();
+    if (previousBin === undefined) delete process.env.CLAUDE_BIN;
+    else process.env.CLAUDE_BIN = previousBin;
+    if (previousConfig === undefined) delete process.env.CLAUDE_PROXY_CONFIG;
+    else process.env.CLAUDE_PROXY_CONFIG = previousConfig;
+    await fixture.cleanup();
+    await rm(sandbox, { recursive: true, force: true });
+  });
+
+  const tools = [
+    {
+      type: "function",
+      function: {
+        name: "daily_write",
+        description: "Write a note",
+        parameters: {
+          type: "object",
+          properties: { name: { type: "string" } },
+          required: ["name"],
+        },
+      },
+    },
+  ];
+  const withTools = {
+    model: "claude-haiku-4-5",
+    messages: [{ role: "user", content: "запиши заметку про CDN" }],
+    tools,
+  };
+
+  /** A run whose StructuredOutput call carries the proxy's own wrapper. */
+  function wrapperRun(payload: unknown): FixtureSpec {
+    const json = JSON.stringify(payload);
+    return {
+      chunks: linesToChunks([
+        initEvent(),
+        messageStart(),
+        textBlockStart(0),
+        textDelta("Sure, let me record that.", 0),
+        blockStop(0),
+        toolUseBlockStart("StructuredOutput", 0),
+        inputJsonDelta(json, 0),
+        blockStop(0),
+        resultMessage({ result: "Sure, let me record that.", structured_output: payload }),
+      ]),
+    };
+  }
+
+  const CALL = {
+    kind: "tool_call",
+    tool_calls: [{ name: "daily_write", arguments: { name: "podeli-cdn" } }],
+  };
+
+  it("hands the CLI a wrapper schema, not the caller's own", async () => {
+    await fixture.use(wrapperRun(CALL));
+    await chat(withTools);
+
+    const record = await fixture.record();
+    const flag = record.argv.indexOf("--json-schema");
+    assert.ok(flag >= 0, "expected --json-schema");
+    const schema = JSON.parse(record.argv[flag + 1]);
+    assert.deepEqual(schema.properties.kind.enum, ["message", "tool_call"]);
+    assert.deepEqual(schema.properties.tool_calls.items.properties.name.enum, ["daily_write"]);
+  });
+
+  it("describes the tools in the system prompt", async () => {
+    await fixture.use(wrapperRun(CALL));
+    await chat(withTools);
+
+    const record = await fixture.record();
+    const system = record.argv.join("\n");
+    assert.match(system, /daily_write/);
+    assert.match(system, /Write a note/);
+  });
+
+  it("returns the call as tool_calls with finish_reason tool_calls", async () => {
+    await fixture.use(wrapperRun(CALL));
+    const { status, json } = await chat(withTools);
+
+    assert.equal(status, 200);
+    const choice = json.choices[0];
+    assert.equal(choice.finish_reason, "tool_calls");
+    assert.equal(choice.message.tool_calls.length, 1);
+    assert.equal(choice.message.tool_calls[0].type, "function");
+    assert.equal(choice.message.tool_calls[0].function.name, "daily_write");
+    assert.deepEqual(JSON.parse(choice.message.tool_calls[0].function.arguments), {
+      name: "podeli-cdn",
+    });
+  });
+
+  it("returns a plain answer when the model chose not to call anything", async () => {
+    await fixture.use(wrapperRun({ kind: "message", content: "уже записано" }));
+    const { json } = await chat(withTools);
+
+    assert.equal(json.choices[0].finish_reason, "stop");
+    assert.equal(json.choices[0].message.content, "уже записано");
+    assert.equal(json.choices[0].message.tool_calls, undefined);
+  });
+
+  it("never leaks the wrapper into content", async () => {
+    await fixture.use(wrapperRun(CALL));
+    const { json } = await chat(withTools);
+    assert.doesNotMatch(String(json.choices[0].message.content ?? ""), /tool_calls|kind/);
+  });
+
+  it("streams the call once, at the end, and closes on tool_calls", async () => {
+    await fixture.use(wrapperRun(CALL));
+    const { events, sawDone, text } = await chatStream(withTools);
+
+    // The wrapper streams as StructuredOutput arguments; none of it is content.
+    assert.equal(text, "");
+    const calls = events.flatMap((e: any) => e.choices?.[0]?.delta?.tool_calls ?? []);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].function.name, "daily_write");
+    assert.equal(calls[0].index, 0);
+    const last = events.at(-1);
+    assert.equal(last.choices[0].finish_reason, "tool_calls");
+    assert.ok(sawDone);
+  });
+
+  it("forwards the results of earlier calls back to the CLI", async () => {
+    await fixture.use(wrapperRun({ kind: "message", content: "готово" }));
+    await chat({
+      ...withTools,
+      messages: [
+        { role: "user", content: "запиши заметку про CDN" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call_1",
+              type: "function",
+              function: { name: "daily_write", arguments: '{"name":"podeli-cdn"}' },
+            },
+          ],
+        },
+        { role: "tool", tool_call_id: "call_1", name: "daily_write", content: "Wrote 182 bytes" },
+      ],
+    });
+
+    // The turn text reaches the CLI on stdin; only the flags are in argv.
+    const record = await fixture.record();
+    assert.match(record.stdin, /<tool_result name="daily_write">/);
+    assert.match(record.stdin, /Wrote 182 bytes/);
+  });
+
+  it("refuses tools and response_format together", async () => {
+    const { status, json } = await chat({
+      ...withTools,
+      response_format: { type: "json_object" },
+    });
+    assert.equal(status, 400);
+    assert.match(json.error.message, /response_format/);
+  });
+
+  it("ignores the tool set when tool_choice withdraws it", async () => {
+    await fixture.use(RESUME_ECHO);
+    await chat({ ...withTools, tool_choice: "none" });
+
+    const record = await fixture.record();
+    assert.ok(!record.argv.includes("--json-schema"), "no wrapper schema");
   });
 });

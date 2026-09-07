@@ -15,6 +15,13 @@ import {
   responseFormatSchema,
 } from "../adapter/openai-to-cli.js";
 import {
+  activeTools,
+  buildToolSchema,
+  parseEmulatedAnswer,
+  toolsPrompt,
+  type EmulatedAnswer,
+} from "../adapter/tool-emulation.js";
+import {
   cliResultToOpenai,
   createDoneChunk,
   extractTextContent,
@@ -31,6 +38,8 @@ import type {
   OpenAIChatRequest,
   OpenAIChatChunk,
   OpenAIChatChunkDelta,
+  OpenAIFunctionTool,
+  OpenAIToolCall,
 } from "../types/openai.js";
 import type {
   ClaudeCliAssistant,
@@ -99,14 +108,56 @@ interface JsonMode {
   systemSuffix?: string;
   /** Hold the text back so a code fence can be stripped before sending it. */
   bufferText: boolean;
+  /**
+   * Set when the request offered tools. The schema above is then the call
+   * wrapper rather than the caller's own, and the answer is unpacked from it.
+   */
+  tools?: OpenAIFunctionTool[];
 }
 
 function resolveJsonMode(body: OpenAIChatRequest): JsonMode {
+  const tools = activeTools(body.tools, body.tool_choice);
+  if (tools) {
+    // Both features want the CLI's single --json-schema slot, and there is no
+    // sane winner: honouring one silently would give the client the other's
+    // shape back.
+    if (body.response_format && body.response_format.type !== "text") {
+      throw new InvalidRequestError(
+        "`tools` and `response_format` cannot be combined: both need the CLI's single --json-schema slot"
+      );
+    }
+    return {
+      schema: JSON.stringify(buildToolSchema(tools, body.tool_choice)),
+      systemSuffix: toolsPrompt(tools, body.tool_choice),
+      bufferText: false,
+      tools,
+    };
+  }
+
   return {
     schema: responseFormatSchema(body.response_format),
     systemSuffix: responseFormatInstruction(body.response_format),
     bufferText: body.response_format?.type === "json_object",
   };
+}
+
+/** The unpacked wrapper, on a request that offered tools. */
+function emulatedFromResult(
+  result: ClaudeCliResult,
+  jsonMode: JsonMode
+): EmulatedAnswer | undefined {
+  if (!jsonMode.tools) return undefined;
+  return parseEmulatedAnswer(result.structured_output);
+}
+
+/** Streaming shape of an emulated call. Arguments arrive whole, not in pieces. */
+function toolCallChunks(calls: OpenAIToolCall[]): OpenAIChatChunkDelta["tool_calls"] {
+  return calls.map((call, index) => ({
+    index,
+    id: call.id,
+    type: "function" as const,
+    function: { name: call.function.name, arguments: call.function.arguments },
+  }));
 }
 
 /** Text of a finished answer, whichever route produced it. */
@@ -115,6 +166,13 @@ function contentFromResult(
   jsonMode: JsonMode,
   fallback: string
 ): string {
+  // With tools in play the structured output is the proxy's own wrapper, not
+  // an answer the client asked for. Only its `content` field is text.
+  if (jsonMode.tools) {
+    const emulated = parseEmulatedAnswer(result.structured_output);
+    if (emulated) return emulated.content;
+    return result.result || fallback;
+  }
   if (jsonMode.schema && result.structured_output !== undefined) {
     return JSON.stringify(result.structured_output);
   }
@@ -568,6 +626,10 @@ async function handleStreamingResponse(
 
     subprocess.on("input_json_delta", (event: ClaudeCliStreamEvent) => {
       if (!inStructuredOutput) return;
+      // With tools the arguments being streamed are the proxy's wrapper. It is
+      // the client's tool call, not its answer, so it goes out once at the end
+      // in `tool_calls` instead of dribbling into `content`.
+      if (jsonMode.tools) return;
       const partial = deltaString(event, "input_json_delta", "partial_json");
       if (!partial) return;
       sse.send(chunk({ content: partial }));
@@ -581,6 +643,14 @@ async function handleStreamingResponse(
     subprocess.on("result", (result: ClaudeCliResult) => {
       isComplete = true;
       session.realSessionId = result.session_id ?? session.realSessionId;
+
+      const toolCalls = emulatedFromResult(result, jsonMode)?.toolCalls ?? [];
+      if (toolCalls.length) {
+        sse.send(chunk({ tool_calls: toolCallChunks(toolCalls) }));
+        // Marked as emitted so the fallback below does not add an empty text
+        // chunk on top of a call the client is already acting on.
+        hasEmittedText = true;
+      }
 
       // Held-back text (json_object) goes out here, fence removed.
       if (jsonMode.bufferText) {
@@ -605,7 +675,11 @@ async function handleStreamingResponse(
 
       rememberSession(session, contentFromResult(result, jsonMode, buffered));
 
-      const doneChunk = createDoneChunk(requestId, model(), finishReasonFromResult(result));
+      const doneChunk = createDoneChunk(
+        requestId,
+        model(),
+        toolCalls.length ? "tool_calls" : finishReasonFromResult(result)
+      );
       if (result.usage) doneChunk.usage = usageFromResult(result);
       sse.send(doneChunk);
       sse.end();
@@ -715,9 +789,20 @@ async function handleNonStreamingResponse(
         jsonMode,
         lastAssistant ? extractTextContent(lastAssistant) : ""
       );
+      const toolCalls = emulatedFromResult(result, jsonMode)?.toolCalls ?? [];
+      // The anchor is rebuilt next turn from the assistant message the client
+      // echoes back, so store exactly the text we are about to send — for a
+      // pure tool call that is the empty string, on both sides.
       rememberSession(session, content);
       respond(() => {
-        res.json(cliResultToOpenai(result, requestId, { model: body.model, content }));
+        res.json(
+          cliResultToOpenai(result, requestId, {
+            model: body.model,
+            content,
+            toolCalls: toolCalls.length ? toolCalls : undefined,
+            finishReason: toolCalls.length ? "tool_calls" : undefined,
+          })
+        );
       });
       const timer = setTimeout(() => subprocess.kill(), config.streaming.resultGraceMs);
       timer.unref();

@@ -135,7 +135,12 @@ export function extractModel(model: string): ClaudeModel {
  *   - A plain string: "Hello"
  *   - An array of content blocks: [{"type": "text", "text": "Hello"}]
  */
-export function extractText(content: string | OpenAIContentBlock[]): string {
+export function extractText(
+  content: string | OpenAIContentBlock[] | null | undefined
+): string {
+  if (content === null || content === undefined) {
+    return "";
+  }
   if (typeof content === "string") {
     return content;
   }
@@ -146,35 +151,6 @@ export function extractText(content: string | OpenAIContentBlock[]): string {
       .join("\n");
   }
   return String(content || "");
-}
-
-/**
- * Strip OpenClaw-specific tooling sections from system prompts.
- * These reference tools (exec, process, web_search, etc.) that don't exist
- * in the Claude Code CLI environment, causing the model to get confused.
- * We remove: ## Tooling, ## Tool Call Style, ## OpenClaw CLI Quick Reference,
- * ## OpenClaw Self-Update
- */
-function stripOpenClawTooling(text: string): string {
-  const sectionsToStrip = [
-    "## Tooling",
-    "## Tool Call Style",
-    "## OpenClaw CLI Quick Reference",
-    "## OpenClaw Self-Update",
-  ];
-  let result = text;
-  for (const section of sectionsToStrip) {
-    // Match from section header to the next ## header (or end of string)
-    const pattern = new RegExp(
-      section.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
-        "\\n[\\s\\S]*?(?=\\n## |$)",
-      "g"
-    );
-    result = result.replace(pattern, "");
-  }
-  // Clean up excessive blank lines left behind
-  result = result.replace(/\n{3,}/g, "\n\n");
-  return result.trim();
 }
 
 /**
@@ -193,7 +169,7 @@ export function splitSystem(messages: OpenAIChatMessage[]): {
 
   for (const msg of messages) {
     if (msg.role === "system") {
-      const text = stripOpenClawTooling(extractText(msg.content));
+      const text = extractText(msg.content);
       if (text) system.push(text);
     } else {
       rest.push(msg);
@@ -219,8 +195,7 @@ export function messagesToPrompt(
     switch (msg.role) {
       case "system":
         // System messages become context instructions
-        // Strip OpenClaw tooling sections that conflict with Claude Code's native tools
-        parts.push(`<system>\n${stripOpenClawTooling(text)}\n</system>\n`);
+        parts.push(`<system>\n${text}\n</system>\n`);
         break;
 
       case "user":
@@ -228,9 +203,23 @@ export function messagesToPrompt(
         parts.push(text);
         break;
 
-      case "assistant":
-        // Previous assistant responses for context
-        parts.push(`<previous_response>\n${text}\n</previous_response>\n`);
+      case "assistant": {
+        // A turn that asked for tools is replayed as the calls it made, so the
+        // model can see what it already tried. Without this the tool results
+        // below would answer questions that are no longer in the transcript.
+        const calls = (msg.tool_calls ?? [])
+          .map((call) => `<tool_call name="${call.function.name}">${call.function.arguments}</tool_call>`)
+          .join("\n");
+        const body = [text, calls].filter(Boolean).join("\n");
+        if (body) parts.push(`<previous_response>\n${body}\n</previous_response>\n`);
+        break;
+      }
+
+      case "tool":
+        // What the caller got back from a call we asked for last turn.
+        parts.push(
+          `<tool_result name="${msg.name ?? msg.tool_call_id ?? "tool"}">\n${text}\n</tool_result>\n`
+        );
         break;
     }
   }

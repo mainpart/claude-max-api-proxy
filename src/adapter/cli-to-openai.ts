@@ -149,7 +149,13 @@ export function resolveResponseModel(
 export function cliResultToOpenai(
   result: ClaudeCliResult,
   requestId: string,
-  options: { model?: string; content?: string; toolCalls?: OpenAIToolCall[] } = {}
+  options: {
+    model?: string;
+    content?: string;
+    toolCalls?: OpenAIToolCall[];
+    /** Overrides the CLI-derived reason, for an emulated tool call. */
+    finishReason?: FinishReason;
+  } = {}
 ): OpenAIChatResponse {
   const cliModel = result.modelUsage ? Object.keys(result.modelUsage)[0] : undefined;
 
@@ -171,7 +177,7 @@ export function cliResultToOpenai(
       {
         index: 0,
         message,
-        finish_reason: finishReasonFromResult(result),
+        finish_reason: options.finishReason ?? finishReasonFromResult(result),
       },
     ],
     usage: usageFromResult(result),
