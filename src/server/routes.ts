@@ -20,6 +20,7 @@ import {
   parseEmulatedAnswer,
   toolsPrompt,
   type EmulatedAnswer,
+  type EmulationIssue,
 } from "../adapter/tool-emulation.js";
 import {
   cliResultToOpenai,
@@ -148,6 +149,86 @@ function emulatedFromResult(
 ): EmulatedAnswer | undefined {
   if (!jsonMode.tools) return undefined;
   return parseEmulatedAnswer(result.structured_output);
+}
+
+/**
+ * Emulated turns since start, and the ways they came back unusable.
+ *
+ * The three degradations all reach the client as an ordinary answer with
+ * `finish_reason: "stop"`, so a client that quietly stopped getting tool calls
+ * looks exactly like one that stopped needing them. These counters are the
+ * difference between noticing that and not.
+ */
+const emulationStats = {
+  turns: 0,
+  /** Turns that named a call. */
+  calls: 0,
+  /**
+   * Turns where the model answered in prose instead. Legitimate on its own —
+   * but this is also the shape the refusal takes when the model tries to *run*
+   * a tool, fails, and relays "No such tool available" as an answer. A wrapper
+   * that says `kind: "message"` is well-formed, so none of the three checks
+   * below sees it; only the ratio of calls to messages does.
+   */
+  messages: 0,
+  degraded: 0,
+  issues: {
+    not_wrapper: 0,
+    empty_tool_call: 0,
+    nameless_entry: 0,
+    unknown_tool: 0,
+  } as Record<EmulationIssue, number>,
+};
+
+/** Snapshot of the counters, for `GET /health`. */
+export function toolEmulationStats(): {
+  turns: number;
+  calls: number;
+  messages: number;
+  degraded: number;
+  issues: Record<EmulationIssue, number>;
+} {
+  return {
+    turns: emulationStats.turns,
+    calls: emulationStats.calls,
+    messages: emulationStats.messages,
+    degraded: emulationStats.degraded,
+    issues: { ...emulationStats.issues },
+  };
+}
+
+/**
+ * Note how the wrapper came back: a line in the log when it came back wrong,
+ * a value for `x-tool-emulation` either way. Changes nothing about the answer.
+ */
+function reportEmulation(
+  requestId: string,
+  jsonMode: JsonMode,
+  result: ClaudeCliResult
+): string | undefined {
+  if (!jsonMode.tools) return undefined;
+
+  const names = jsonMode.tools.map((tool) => tool.function.name);
+  const answer = parseEmulatedAnswer(result.structured_output, names);
+  const issues: EmulationIssue[] = answer ? answer.issues : ["not_wrapper"];
+
+  emulationStats.turns++;
+  const named = Boolean(answer?.toolCalls.length);
+  if (named) emulationStats.calls++;
+  else emulationStats.messages++;
+  if (issues.length === 0) return named ? "tool_call" : "message";
+
+  emulationStats.degraded++;
+  for (const issue of issues) emulationStats.issues[issue] += 1;
+  // Tool count and prompt size go in because that is the axis the failure
+  // moves along: the longer the list, the likelier the model answers about
+  // the tools instead of naming one.
+  console.warn(
+    `[tool-emulation] ${requestId} ${issues.join(",")}` +
+      ` tools=${names.length} prompt=${jsonMode.systemSuffix?.length ?? 0}B` +
+      ` cli_turns=${result.num_turns ?? "?"}`
+  );
+  return issues.join(",");
 }
 
 /** Streaming shape of an emulated call. Arguments arrive whole, not in pieces. */
@@ -333,6 +414,15 @@ export async function handleChatCompletions(
     // Convert to CLI input format, resuming a persisted session when we have one
     const index = getSessionIndex(config.sessionIndexPath);
     const { cliInput, session } = await resolveCliInput(body, config, index);
+
+    // Which transcript this turn runs in, and whether it is a continuation.
+    // Both are known before the CLI starts, so they survive the streaming
+    // case, where headers are gone long before the answer is. Headers rather
+    // than body fields: the body has to stay OpenAI-shaped and strict clients
+    // reject what they do not recognise, while a header is safely ignored.
+    res.setHeader("x-claude-session-id", session.sessionId);
+    res.setHeader("x-claude-session-resumed", session.resume ? "true" : "false");
+
     const subprocess = new ClaudeSubprocess(config);
 
     try {
@@ -644,6 +734,10 @@ async function handleStreamingResponse(
       isComplete = true;
       session.realSessionId = result.session_id ?? session.realSessionId;
 
+      // Only the log here: by now the SSE headers have long been sent, and the
+      // final chunk has to stay a plain OpenAI chunk.
+      reportEmulation(requestId, jsonMode, result);
+
       const toolCalls = emulatedFromResult(result, jsonMode)?.toolCalls ?? [];
       if (toolCalls.length) {
         sse.send(chunk({ tool_calls: toolCallChunks(toolCalls) }));
@@ -794,7 +888,14 @@ async function handleNonStreamingResponse(
       // echoes back, so store exactly the text we are about to send — for a
       // pure tool call that is the empty string, on both sides.
       rememberSession(session, content);
+      const emulation = reportEmulation(requestId, jsonMode, result);
       respond(() => {
+        // `num_turns` above one means the CLI re-asked the model — the
+        // structured-output retry loop, which is what makes a failed turn cost
+        // five times a successful one.
+        res.setHeader("x-claude-cli-turns", String(result.num_turns ?? 1));
+        if (session.realSessionId) res.setHeader("x-claude-session-id", session.realSessionId);
+        if (emulation) res.setHeader("x-tool-emulation", emulation);
         res.json(
           cliResultToOpenai(result, requestId, {
             model: body.model,
@@ -894,5 +995,6 @@ export function handleHealth(_req: Request, res: Response): void {
     status: "ok",
     provider: "claude-code-cli",
     timestamp: new Date().toISOString(),
+    tool_emulation: toolEmulationStats(),
   });
 }

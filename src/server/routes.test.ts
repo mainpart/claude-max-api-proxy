@@ -59,14 +59,16 @@ async function startWith(overrides: ServerConfig = {}): Promise<void> {
   baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 }
 
-async function chat(body: unknown): Promise<{ status: number; json: any }> {
+async function chat(
+  body: unknown
+): Promise<{ status: number; json: any; headers: Headers }> {
   const res = await fetch(`${baseUrl}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
   const text = await res.text();
-  return { status: res.status, json: text ? JSON.parse(text) : null };
+  return { status: res.status, json: text ? JSON.parse(text) : null, headers: res.headers };
 }
 
 /** Bypasses JSON.stringify so the test can send a body the parser will reject. */
@@ -1124,5 +1126,64 @@ describe("tool calling", () => {
 
     const record = await fixture.record();
     assert.ok(!record.argv.includes("--json-schema"), "no wrapper schema");
+  });
+
+  it("reports the session and the emulation in headers", async () => {
+    await fixture.use(wrapperRun(CALL));
+    const { headers } = await chat(withTools);
+
+    assert.match(String(headers.get("x-claude-session-id")), /^[0-9a-f-]{36}$/);
+    assert.equal(headers.get("x-claude-session-resumed"), "false");
+    assert.equal(headers.get("x-tool-emulation"), "tool_call");
+    assert.ok(Number(headers.get("x-claude-cli-turns")) >= 1);
+  });
+
+  it("marks a turn where the wrapper never appeared", async () => {
+    // The failure this whole thing was built to catch: the model answered
+    // about the tools instead of naming one, and the client saw a normal reply.
+    await fixture.use(wrapperRun({ answer: "No such tool available: search" }));
+    const { json, headers } = await chat(withTools);
+
+    assert.equal(json.choices[0].finish_reason, "stop");
+    assert.equal(headers.get("x-tool-emulation"), "not_wrapper");
+  });
+
+  it("marks a turn that announced a call and named none", async () => {
+    await fixture.use(wrapperRun({ kind: "tool_call", tool_calls: [] }));
+    const { headers } = await chat(withTools);
+    assert.equal(headers.get("x-tool-emulation"), "empty_tool_call");
+  });
+
+  it("counts the degradations for /health", async () => {
+    const res = await fetch(`${baseUrl}/health`);
+    const health = (await res.json()) as any;
+    assert.ok(health.tool_emulation.turns > 0);
+    assert.ok(health.tool_emulation.degraded > 0);
+    assert.ok(health.tool_emulation.issues.not_wrapper > 0);
+    // Calls against messages is the ratio that catches the refusal the three
+    // checks miss: a well-formed wrapper that simply never names a tool.
+    assert.ok(health.tool_emulation.calls > 0);
+    assert.ok(health.tool_emulation.messages > 0);
+    assert.equal(
+      health.tool_emulation.calls + health.tool_emulation.messages,
+      health.tool_emulation.turns
+    );
+  });
+
+  it("says a resumed turn is resumed", async () => {
+    await fixture.use(wrapperRun({ kind: "message", content: "первый" }));
+    const first = { ...withTools, user: "carla" };
+    await chat(first);
+
+    await fixture.use(wrapperRun({ kind: "message", content: "второй" }));
+    const { headers } = await chat({
+      ...first,
+      messages: [
+        ...first.messages,
+        { role: "assistant", content: "первый" },
+        { role: "user", content: "и ещё" },
+      ],
+    });
+    assert.equal(headers.get("x-claude-session-resumed"), "true");
   });
 });

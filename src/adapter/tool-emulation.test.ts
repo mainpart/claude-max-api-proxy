@@ -93,12 +93,62 @@ describe("toolsPrompt", () => {
   it("drops the plain-answer option when a call is required", () => {
     assert.match(toolsPrompt([WRITE], "required"), /must call a tool/i);
   });
+
+  it("fences the list in tags the model can see the end of", () => {
+    const prompt = toolsPrompt([WRITE, READ], "auto");
+    const open = prompt.indexOf("<available_tools>");
+    const close = prompt.indexOf("</available_tools>");
+    assert.ok(open >= 0 && close > open, "expected the list to be fenced");
+    assert.ok(prompt.indexOf("daily_write") > open, "names belong inside the fence");
+    assert.ok(prompt.indexOf("### read") < close, "names belong inside the fence");
+  });
+
+  it("repeats the frame after the list, not only before it", () => {
+    // On a long list the opening frame is thousands of tokens behind by the
+    // time the model reaches the end, and it starts trying to run the tools.
+    const prompt = toolsPrompt([WRITE, READ], "auto");
+    const close = prompt.indexOf("</available_tools>");
+    assert.match(prompt.slice(0, prompt.indexOf("<available_tools>")), /do not execute anything yourself/i);
+    assert.match(prompt.slice(close), /caller's tools, not yours/i);
+    assert.match(prompt.slice(close), /no(ne)? of your own/i);
+  });
+
+  it("forbids the refusal we actually saw", () => {
+    // "No such tool available", relayed as prose, on a turn that called nothing.
+    const prompt = toolsPrompt([WRITE], "auto");
+    assert.match(prompt, /never reply that a tool is unavailable/i);
+    assert.match(prompt, /never try to invoke one/i);
+  });
+
+  it("keeps every name on a list the size ReMe actually sends", () => {
+    const many: OpenAIFunctionTool[] = Array.from({ length: 31 }, (_, i) => ({
+      type: "function",
+      function: {
+        name: `tool_${i}`,
+        description: `Tool number ${i}`,
+        parameters: {
+          type: "object",
+          properties: { path: { type: "string" }, limit: { type: "integer" } },
+          required: ["path"],
+        },
+      },
+    }));
+
+    const prompt = toolsPrompt(many, "auto");
+    for (const tool of many) assert.match(prompt, new RegExp(`### ${tool.function.name}\\b`));
+
+    const schema = buildToolSchema(many, "auto") as any;
+    assert.deepEqual(
+      schema.properties.tool_calls.items.properties.name.enum,
+      many.map((t) => t.function.name)
+    );
+  });
 });
 
 describe("parseEmulatedAnswer", () => {
   it("reads a plain answer", () => {
     const answer = parseEmulatedAnswer({ kind: "message", content: "готово" });
-    assert.deepEqual(answer, { content: "готово", toolCalls: [] });
+    assert.deepEqual(answer, { content: "готово", toolCalls: [], issues: [] });
   });
 
   it("reads a call and serialises its arguments", () => {
@@ -125,7 +175,7 @@ describe("parseEmulatedAnswer", () => {
   it("does not report a call when the list came back empty", () => {
     // Otherwise the client waits forever for a tool it was never named.
     const answer = parseEmulatedAnswer({ kind: "tool_call", tool_calls: [] });
-    assert.deepEqual(answer, { content: "", toolCalls: [] });
+    assert.deepEqual(answer, { content: "", toolCalls: [], issues: ["empty_tool_call"] });
   });
 
   it("skips entries with no name rather than failing the turn", () => {
@@ -134,6 +184,26 @@ describe("parseEmulatedAnswer", () => {
       tool_calls: [{ arguments: {} }, { name: "read", arguments: {} }],
     });
     assert.equal(answer?.toolCalls.length, 1);
+    assert.deepEqual(answer?.issues, ["nameless_entry"]);
+  });
+
+  it("reports a name the request never offered, without dropping the call", () => {
+    // Passing it through is the old behaviour and stays; what is new is that
+    // the caller now hears about it.
+    const answer = parseEmulatedAnswer(
+      { kind: "tool_call", tool_calls: [{ name: "rm_rf", arguments: {} }] },
+      ["daily_write", "read"]
+    );
+    assert.equal(answer?.toolCalls[0].function.name, "rm_rf");
+    assert.deepEqual(answer?.issues, ["unknown_tool"]);
+  });
+
+  it("says nothing is wrong when the call is one of the offered names", () => {
+    const answer = parseEmulatedAnswer(
+      { kind: "tool_call", tool_calls: [{ name: "read", arguments: {} }] },
+      ["daily_write", "read"]
+    );
+    assert.deepEqual(answer?.issues, []);
   });
 
   it("returns nothing for a payload that is not the wrapper", () => {

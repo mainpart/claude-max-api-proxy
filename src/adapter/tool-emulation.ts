@@ -25,10 +25,27 @@ import type {
   OpenAIToolChoice,
 } from "../types/openai.js";
 
+/**
+ * A way the wrapper came back unusable. None of these fails the request — the
+ * client gets an ordinary-looking answer either way — which is exactly why
+ * they are named: otherwise the emulation degrades in silence.
+ */
+export type EmulationIssue =
+  /** The payload is not the wrapper at all; the CLI's own prose goes out instead. */
+  | "not_wrapper"
+  /** `kind: "tool_call"` with nothing in `tool_calls`. */
+  | "empty_tool_call"
+  /** An entry with no `name`, dropped. */
+  | "nameless_entry"
+  /** A name the request never offered, passed through as the client's problem. */
+  | "unknown_tool";
+
 /** What the model answered, once the wrapper is unpacked. */
 export interface EmulatedAnswer {
   content: string;
   toolCalls: OpenAIToolCall[];
+  /** How the wrapper degraded, if it did. Empty on a clean turn. */
+  issues: EmulationIssue[];
 }
 
 /** Tools the request actually offers, or undefined when it offers none. */
@@ -129,6 +146,11 @@ export function toolsPrompt(
     "do not read, write or run anything, and do not use any tool of your own.",
     "Name the call and the caller will perform it, then send you the result.",
     "",
+    // Tags, because the list can run to tens of kilobytes and the model has to
+    // be able to tell where the caller's schemas stop and the instructions
+    // resume.
+    "<available_tools>",
+    "",
   ];
 
   for (const tool of tools) {
@@ -141,6 +163,21 @@ export function toolsPrompt(
     lines.push("```");
     lines.push("");
   }
+
+  lines.push("</available_tools>");
+  lines.push("");
+
+  // The same frame as above, repeated below the list. On a long list the
+  // opening frame is thousands of tokens behind by the time the model reaches
+  // the end, and it starts trying to *run* what it has just read. The CLI has
+  // none of those tools, so its "No such tool available" comes back to the
+  // client as prose — a turn that looks answered and called nothing.
+  lines.push(
+    "Those are the caller's tools, not yours. You have none of your own here, and",
+    "that is expected, not a fault. Naming a call is the whole action being asked",
+    "of you: the caller runs it and sends you the result on the next turn."
+  );
+  lines.push("");
 
   lines.push("## How to answer");
   lines.push("");
@@ -158,6 +195,11 @@ export function toolsPrompt(
   }
   lines.push("");
   lines.push("`arguments` is a JSON object matching that tool's schema above — not a string.");
+  lines.push(
+    "Never reply that a tool is unavailable, missing, not initialised or not",
+    "connected, and never try to invoke one — running it is the caller's job, and",
+    "it can only run what you name."
+  );
   lines.push("Results of earlier calls appear in the conversation inside <tool_result> tags.");
 
   return lines.join("\n");
@@ -174,7 +216,11 @@ function callId(index: number): string {
  * is not the wrapper at all, so the caller can fall back to plain text rather
  * than fail the request.
  */
-export function parseEmulatedAnswer(structured: unknown): EmulatedAnswer | undefined {
+export function parseEmulatedAnswer(
+  structured: unknown,
+  /** Names the request offered, when the caller has them to hand. */
+  known?: readonly string[]
+): EmulatedAnswer | undefined {
   if (typeof structured !== "object" || structured === null || Array.isArray(structured)) {
     return undefined;
   }
@@ -183,12 +229,20 @@ export function parseEmulatedAnswer(structured: unknown): EmulatedAnswer | undef
 
   const content = typeof payload.content === "string" ? payload.content : "";
   const raw = Array.isArray(payload.tool_calls) ? payload.tool_calls : [];
+  const issues: EmulationIssue[] = [];
 
   const toolCalls: OpenAIToolCall[] = [];
   for (const [index, entry] of raw.entries()) {
-    if (typeof entry !== "object" || entry === null) continue;
+    if (typeof entry !== "object" || entry === null) {
+      issues.push("nameless_entry");
+      continue;
+    }
     const call = entry as Record<string, unknown>;
-    if (typeof call.name !== "string" || !call.name) continue;
+    if (typeof call.name !== "string" || !call.name) {
+      issues.push("nameless_entry");
+      continue;
+    }
+    if (known && !known.includes(call.name)) issues.push("unknown_tool");
 
     // Models sometimes send the arguments already serialised. Both are fine;
     // what leaves here is always a string, as the OpenAI shape requires.
@@ -206,7 +260,8 @@ export function parseEmulatedAnswer(structured: unknown): EmulatedAnswer | undef
   // `kind: "tool_call"` with nothing in it is not a call. Reporting it as one
   // would leave the client waiting for a tool it was never told to run.
   if (payload.kind === "tool_call" && toolCalls.length === 0) {
-    return { content, toolCalls: [] };
+    issues.push("empty_tool_call");
+    return { content, toolCalls: [], issues };
   }
-  return { content, toolCalls: payload.kind === "tool_call" ? toolCalls : [] };
+  return { content, toolCalls: payload.kind === "tool_call" ? toolCalls : [], issues };
 }
