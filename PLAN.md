@@ -126,16 +126,89 @@ there is no defensible winner. The 400 already explains itself.
 costs a full turn. `parseEmulatedAnswer` declines to report an empty list as a call, and the
 comment there says why.
 
-## Larger than any of the above: the prompt cache never hits
+## Measured and closed: the model decides whether emulation works at all
 
-Every request that offered tools reported `cached_tokens: 0`, including the second turn of a
-resumed conversation. A prompt carrying the wrapper schema and the tool descriptions starts
-around 1 500 tokens, and on a miss the whole of it is paid again each turn — in subscription
-allowance and in latency both.
+Emulated tool calling is not equally available on every model, and on Haiku 4.5 it barely
+works. The list of tools goes into the system prompt as text, and the model is asked to *name*
+a call; Haiku instead tries to *run* one, the CLI has no such tool (`--tools ""` under the
+`economy` preset), and its "No such tool available" comes back to the client as prose.
 
-The likely cause is that `--json-schema` changes the `tools` array of the underlying API
-request and so breaks the cacheable prefix, but that is a guess. Measure before changing
-anything: compare `cache_read_input_tokens` across turns with and without tools, and check
-whether the schema is byte-identical between turns of one conversation. The system prompt is
-already known to re-cache the whole history when a single phrase in it changes (see
-`CLAUDE.md`), and `toolsPrompt` is rebuilt on every request.
+Measured 7 Sep 2026, five probes per cell, a fresh session per probe — a unique nonce in every
+request, without which `lookupKeys` gives one prefix key and the probes append to a single CLI
+transcript:
+
+| tools offered | 4 | 7 | 16 | 31 |
+|---|---|---|---|---|
+| haiku-4-5, named a call | 2/5 | 0/5 | 0/5 | 0/5 |
+| sonnet-4-5 | 5/5 | 5/5 | 5/5 | 5/5 |
+| sonnet-5 | 5/5 | 5/5 | 5/5 | 5/5 |
+
+Cost follows the same split. At 31 tools Haiku burns a median 33 778 prompt tokens over six CLI
+turns and answers nothing — the `structured-output-enforce` loop re-asks, and the prompt is
+paid again each time. Sonnet takes 7 064 in two turns and answers in five seconds. The schemas
+themselves are 14 KB, about 4 000 tokens, so Sonnet's figure is the floor and Haiku's is waste.
+
+There is no threshold in the number of tools. The refusal is probabilistic and grows with the
+length of the list; 4 tools on Haiku failed three times in five.
+
+**What the prompt can and cannot do.** `toolsPrompt` now fences the list in `<available_tools>`
+tags, repeats the frame *after* the list as well as before it, and forbids the refusal outright
+("never reply that a tool is unavailable"). On a long list the opening frame is thousands of
+tokens behind by the time the model reaches the end. It did not rescue Haiku: 2/5 at four tools
+after the change, against a refusal before it. Prompt wording is not the lever here; the model
+is.
+
+**What the refusal actually looks like, and why the obvious detector misses it.** The wrapper
+comes back well-formed, with `kind: "message"` and the refusal in `content`. None of the three
+malformed-wrapper checks fires, because nothing is malformed — the model simply exercised its
+right to answer in prose. So `GET /health` counts `calls` against `messages` as well as the
+three degradations: a caller whose tool calls quietly stopped shows up as turns growing while
+calls do not.
+
+## Reported rather than fixed: how a turn went
+
+Three facts about a finished turn had no way of reaching the caller, and each of them separates
+two situations that look identical in the response body.
+
+- `x-claude-session-id`, `x-claude-session-resumed` — whether this turn continued a transcript
+  or started one, and which. Known before the CLI starts, so it survives streaming.
+- `x-claude-cli-turns` — CLI turns inside one HTTP request. Above one means the structured
+  output was re-asked, which is what makes a failed turn cost five times a successful one.
+- `x-tool-emulation` — `tool_call`, `message`, or the degradation that occurred.
+
+Headers rather than body fields: the body has to stay OpenAI-shaped and strict clients reject
+what they do not recognise, while a header is ignored safely and still shows up in `curl -i`.
+The last two are only known when the answer is, so on a streaming request they go to the log
+and not to the client.
+
+`cached_tokens` cannot stand in for any of this, though it looks like it should. A run that
+succeeded on the first attempt still reported 92% cache — that is Anthropic's prefix cache
+working *across* HTTP requests, not a transcript accumulating within one. A fresh session and a
+resumed one are indistinguishable by it.
+
+## Checked and closed: the prompt cache
+
+Every request that offered tools reported `cached_tokens: 0`, which looked like `--json-schema`
+breaking the cacheable prefix, or like the session key failing on tool turns. Neither is true.
+The zeros come from the minimum cacheable prefix, which is the API's rule and not this proxy's:
+below it nothing is written to the cache, so nothing can be read back on the turn after.
+
+| Model | Documented minimum | Measured through the proxy |
+|---|---|---|
+| Haiku 4.5 | 4 096 | 3 964 → no cache; 4 430 → 4 420 read back |
+| Sonnet 4.5 | 1 024 | 1 738 → 1 736 read back |
+| Opus 4.8 | 1 024 | not measured |
+| Opus 5 | 512 | not measured |
+
+The threshold is per model and Haiku 4.5 has by far the highest one, so a conversation that
+caches happily on Sonnet never caches on Haiku. A request offering one small tool starts around
+1 500 tokens — over the Sonnet threshold, nowhere near the Haiku one. Since `extractModel`
+falls back to opus for an unrecognised model, the default path is the forgiving one; the
+measurements that raised the alarm were all taken on haiku.
+
+Session resume was the other suspect and is also fine. With `DEBUG_SUBPROCESS=1`, every turn
+after the first was issued as `--resume` against the session the previous turn created, with
+tools and without, and only the new turn went down stdin.
+
+What remains true is that tools are not free: the wrapper schema and the tool descriptions add
+roughly 1 100 prompt tokens to every turn, paid whether or not the cache covers them.

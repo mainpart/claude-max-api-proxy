@@ -84,6 +84,20 @@ resume with --system-prompt ''       cache_create 10934   cache_read    0
 `--system-prompt-snapshot` does not help in `--print` mode; the new prompt wins whether it is
 `on`, `off`, or absent.
 
+**Prompt caching has a minimum prefix, and it is per model.** Below it nothing is written to
+the cache, so `cached_tokens` stays zero on every turn and reads like a bug in the proxy.
+
+| Model | Documented minimum | Measured through the proxy |
+|---|---|---|
+| Haiku 4.5 | 4 096 | 3 964 → no cache; 4 430 → 4 420 read back |
+| Sonnet 4.5 | 1 024 | 1 738 → 1 736 read back |
+| Opus 4.8 | 1 024 | not measured |
+| Opus 5 | 512 | not measured |
+
+Haiku 4.5 has the highest bar of the current models, which is why a short conversation caches
+on Sonnet and never on Haiku. Check the prompt size against the model's threshold before
+looking for a cause anywhere else.
+
 **Flags.** `--system-prompt ""` removes the system block from the request; omitting the flag
 substitutes Claude Code's built-in prompt (~13 890 characters). `--bare` cannot be used — it
 forces `ANTHROPIC_API_KEY`/`apiKeyHelper` auth and the OAuth subscription stops working;
@@ -112,6 +126,23 @@ carries both a serialised `result` and a parsed `structured_output`; `num_turns`
 undocumented `[structured-output-enforce]` user turn and asks again. A schema can also be
 satisfied while empty — asked something outside it, the model returns `""` in the required
 field.
+
+**Emulated tool calling is model-dependent, and Haiku 4.5 cannot do it.** Asked to *name* a
+call from a list of schemas in the system prompt, Haiku tries to *run* one instead; there is no
+such tool in the CLI, and the resulting "No such tool available" is relayed to the client as
+prose. Measured 7 Sep 2026, five probes per cell, fresh session each — give every probe a
+unique nonce or `lookupKeys` puts them all in one transcript:
+
+| tools offered | 4 | 7 | 16 | 31 |
+|---|---|---|---|---|
+| haiku-4-5, named a call | 2/5 | 0/5 | 0/5 | 0/5 |
+| sonnet-4-5 / sonnet-5 | 5/5 | 5/5 | 5/5 | 5/5 |
+
+The failure is probabilistic, not a threshold in the tool count, and it is expensive: 31 tools
+on Haiku cost a median 33 778 prompt tokens over six CLI turns and produced no call, against
+7 064 over two turns on Sonnet. The refusal arrives as a *well-formed* wrapper with
+`kind: "message"`, so it looks like an ordinary answer — `GET /health` reports `calls` against
+`messages` for exactly this reason. Prompt wording does not fix it; the model choice does.
 
 **Transcripts** live in `~/.claude/projects/<working directory with every non-alphanumeric
 character replaced by a dash>/<session-id>.jsonl`. Resolve the path through symlinks first —
